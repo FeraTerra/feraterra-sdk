@@ -1,0 +1,3778 @@
+"""
+Arena Exchange v4.9 — Zero-Dependency Model Context Protocol (MCP) JSON-RPC 2.0 Server
+(`scripts/arena_mcp_server.py`)
+
+Exposes Arena Exchange's headless HTTP REST, stateless `POST /order/preview`, 64-byte
+binary TCP wire (`ArenaWire`), zero-capital flash-arbitrage & liquidation sweepers,
+cryptographic ledger-tip/Merkle-escape verification, Prime sub-account/drawdown risk
+guardrails, self-service testnet onboarding, and `ArenaCcxtAdapter` market-normalization
+utilities over BOTH MCP `stdio` (newline-delimited JSON-RPC 2.0 + `Content-Length`
+framing) and Streamable HTTP (`POST /mcp`, `GET /mcp/health`).
+"""
+from __future__ import annotations
+
+import argparse
+from decimal import Decimal
+import hmac
+import http.server
+import io
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import sys
+import threading
+from typing import Any, BinaryIO, Dict, List, Optional, Tuple
+import urllib.parse
+
+_THIS_DIR = Path(__file__).resolve().parent
+REPO_ROOT = _THIS_DIR.parent.parent if _THIS_DIR.name == "python" and _THIS_DIR.parent.name == "sdk" else _THIS_DIR.parent
+for _cand_dir in (_THIS_DIR, REPO_ROOT / "sdk" / "python"):
+    if (_cand_dir / "arena_sdk.py").is_file() and str(_cand_dir) not in sys.path:
+        sys.path.insert(0, str(_cand_dir))
+
+from arena_sdk import (  # noqa: E402
+    ARENA_WIRE_BYTES,
+    MASK64,
+    MAX_WIRE_HEADER_QTY_LOTS,
+    PUBLIC_TESTNET_URL,
+    ArenaBinaryClient,
+    ArenaCcxtAdapter,
+    ArenaHttpClient,
+    EthWalletSigner,
+    EvmJsonRpcClient,
+    OrderSide,
+    StpMode,
+    TimeInForce,
+    WireStatusCode,
+    base_to_qty_lots,
+    micro_to_usd_str,
+    price_ticks_to_usd_str,
+    qty_lots_to_base_str,
+    reconstruct_escape_merkle_proof_from_logs,
+    usd_to_micro,
+    usd_to_price_ticks,
+    verify_escape_merkle_proof,
+    verify_ledger_tip,
+)
+
+MCP_PROTOCOL_VERSION = "2024-11-05"
+SERVER_NAME = "arena-exchange-mcp"
+SERVER_VERSION = "4.9.0"
+DEFAULT_LOCAL_ARENA_URL = "http://127.0.0.1:8080"
+PUBLIC_TESTNET_ARENA_URL = PUBLIC_TESTNET_URL
+MAX_STDIO_MESSAGE_BYTES = 4 * 1024 * 1024
+MAX_BUILDER_FEE_SHARE_BPS = 5000
+
+READ_ONLY_TOOLS = frozenset(
+    {
+        "arena_health_and_manifest",
+        "arena_list_markets",
+        "arena_get_orderbook",
+        "arena_get_trades_and_candles",
+        "arena_get_leaderboard",
+        "arena_get_account_portfolio",
+        "arena_verify_ledger_tip",
+        "arena_get_withdrawals_and_escape_proof",
+        "arena_preview_order",
+    }
+)
+
+RISK_INCREASING_TOOLS = frozenset(
+    {
+        "arena_place_order",
+        "arena_replace_two_sided_quote",
+        "arena_modify_order",
+        "arena_execute_atomic_basket",
+        "arena_portfolio_delta_hedge",
+        "arena_subscribe_express_port",
+        "arena_flash_arbitrage",
+        "arena_auto_liquidate",
+    }
+)
+
+_SENSITIVE_FIELDS = frozenset(
+    {
+        "api_key",
+        "api_secret",
+        "wire_key_lo64",
+        "wire_key_hi64",
+        "wire_key_lo_hex",
+        "wire_key_hi_hex",
+        "wallet_privkey",
+        "privkey",
+        "private_key",
+    }
+)
+
+
+_SECRET_KV_RE = re.compile(
+    r'("?(?:api_key|api_secret|wallet_privkey|private_key|privkey|wire_key_lo64|wire_key_hi64|wire_key_lo_hex|wire_key_hi_hex)"?\s*[:=]\s*)'
+    r'("[^"]*"|\'[^\']*\'|0x[0-9a-fA-F]+|[^\s,}\]]+)',
+    re.IGNORECASE,
+)
+
+
+def _scrub_secrets(obj: Any, *, text_scrubber: Optional[Any] = None) -> Any:
+    if isinstance(obj, dict):
+        return {
+            str(k): ("[REDACTED]" if str(k).lower() in _SENSITIVE_FIELDS else _scrub_secrets(v, text_scrubber=text_scrubber))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_scrub_secrets(x, text_scrubber=text_scrubber) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(_scrub_secrets(x, text_scrubber=text_scrubber) for x in obj)
+    if isinstance(obj, str):
+        s = text_scrubber(obj) if text_scrubber is not None else obj
+        return _SECRET_KV_RE.sub(r"\1[REDACTED]", s)
+    return obj
+
+
+def _json_dumps(obj: Any) -> str:
+    return json.dumps(obj, separators=(",", ":"), sort_keys=False)
+
+
+def _canonical_market_kind(raw_kind: object) -> str:
+    k = str(raw_kind or "").strip().lower()
+    if k in ("perp", "linear_perp", "linear_perpetual"):
+        return "perp"
+    if k in ("formula_perp", "formula_perpetual"):
+        return "formula_perp"
+    return k
+
+
+def _norm_eth_address(addr: str) -> str:
+    s = str(addr or "").strip()
+    if s.startswith(("0x", "0X")):
+        s = "0x" + s[2:].lower()
+    elif len(s) == 40:
+        s = "0x" + s.lower()
+    if len(s) != 42 or not s.startswith("0x"):
+        raise ValueError(f"Invalid Ethereum address: {addr!r}")
+    int(s[2:], 16)
+    return s
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+def _parse_int_csv(raw: str) -> Optional[frozenset[int]]:
+    txt = str(raw or "").strip()
+    if not txt:
+        return None
+    vals: set[int] = set()
+    for part in txt.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        v = int(p)
+        if v <= 0:
+            raise ValueError(f"Allowed account ID must be > 0, got {v}")
+        vals.add(v)
+    return frozenset(vals) if vals else None
+
+
+def _parse_addr_csv(raw: str) -> Optional[frozenset[str]]:
+    txt = str(raw or "").strip()
+    if not txt:
+        return None
+    addrs: set[str] = set()
+    for part in txt.split(","):
+        p = part.strip()
+        if p:
+            addrs.add(_norm_eth_address(p))
+    return frozenset(addrs) if addrs else None
+
+
+def _read_exact_bytes(stream: BinaryIO, count: int) -> Optional[bytes]:
+    buf = bytearray()
+    while len(buf) < count:
+        chunk = stream.read(count - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+class McpStdioTransport:
+    """Dual-framing (JSONL & Content-Length) MCP stdio frame reader/writer."""
+
+    def __init__(self, stdin_stream: BinaryIO, stdout_stream: BinaryIO) -> None:
+        self._in = stdin_stream
+        self._out = stdout_stream
+
+    def read_message(self) -> Tuple[Optional[bytes], bool]:
+        while True:
+            line = self._in.readline(MAX_STDIO_MESSAGE_BYTES + 1)
+            if not line:
+                return None, False
+            if len(line) > MAX_STDIO_MESSAGE_BYTES:
+                raise ValueError("MCP stdio line exceeds 4 MiB safety limit")
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if not stripped.startswith((b"{", b"[")) and b":" in stripped:
+                headers: Dict[str, str] = {}
+                cur_line = line
+                header_lines = 0
+                while True:
+                    txt = cur_line.decode("ascii", errors="replace").strip()
+                    if not txt:
+                        break
+                    header_lines += 1
+                    if header_lines > 64:
+                        raise ValueError("MCP stdio header block exceeds 64-line safety limit")
+                    if ":" in txt:
+                        k, v = txt.split(":", 1)
+                        headers[k.strip().lower()] = v.strip()
+                    cur_line = self._in.readline(65536)
+                    if not cur_line:
+                        return None, True
+                cl_raw = headers.get("content-length", "")
+                try:
+                    length = int(cl_raw)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid Content-Length header: {cl_raw!r}") from exc
+                if length <= 0 or length > MAX_STDIO_MESSAGE_BYTES:
+                    raise ValueError(f"Content-Length {length} out of bounds [1, {MAX_STDIO_MESSAGE_BYTES}]")
+                body = _read_exact_bytes(self._in, length)
+                if body is None:
+                    raise ValueError("Unexpected EOF reading Content-Length body")
+                return body, True
+            return stripped, False
+
+    def write_message(self, payload_obj: Any, use_content_length: bool) -> None:
+        raw = _json_dumps(payload_obj).encode("utf-8")
+        if use_content_length:
+            hdr = f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii")
+            self._out.write(hdr + raw)
+        else:
+            self._out.write(raw + b"\n")
+        self._out.flush()
+
+
+def _tool_specs() -> List[Dict[str, Any]]:
+    return [
+        {
+            "name": "arena_health_and_manifest",
+            "description": "Check Arena Exchange daemon health, conservation status, WAL sequence, and public manifest.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "include_manifest": {"type": "boolean", "default": True},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_list_markets",
+            "description": "List Arena Exchange markets (Spot, LinearPerpetual, FormulaPerpetual, BoundedClaim, SpreadBook) with exact tick/lot pricing and BBOs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "description": "Optional market kind filter (e.g. spot, perp, formula_perp, bounded_claim, spread_book)."},
+                    "symbol": {"type": "string", "description": "Optional exact or unified market symbol filter."},
+                    "active_only": {"type": "boolean", "default": True},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_get_orderbook",
+            "description": "Fetch live L2/L3 orderbook snapshot for an Arena market by symbol (e.g. BTC/USD:USD or BTC-USD-PERP) or market_id.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string"},
+                    "market_id": {"type": "integer", "minimum": 1},
+                    "depth": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_get_trades_and_candles",
+            "description": "Fetch recent trades and OHLCV candles for an Arena market.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string"},
+                    "market_id": {"type": "integer", "minimum": 1},
+                    "interval": {"type": "string", "enum": ["tick", "1s", "1m"], "default": "1m"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 240, "default": 50},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_get_leaderboard",
+            "description": "Fetch the public Gladiator Leaderboard ranking active accounts by equity, PnL, maker BBO streak, volume, or ROI.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 25},
+                    "sort": {
+                        "type": "string",
+                        "enum": ["equity", "pnl", "streak", "volume", "roi"],
+                        "default": "equity",
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_get_account_portfolio",
+            "description": "Inspect account USD balances, physical Spot collateral, perp/claim positions, equity, IMR/MMR, drawdown stop, builder binding, and open orders.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "account_id": {"type": "integer", "minimum": 1},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_verify_ledger_tip",
+            "description": "Fetch GET /ledger/tip and cryptographically verify its ARENA_LEDGER_TIP_V2_1 Keccak-256 + secp256k1 operator signature.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "expected_operator_address": {"type": "string", "description": "Optional 0x address overriding CLI pinned operator address."},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_get_withdrawals_and_escape_proof",
+            "description": "Fetch account withdrawal vouchers and optionally verify an off-chain or L1 log-reconstructed Merkle emergency escape proof.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "account_id": {"type": "integer", "minimum": 1},
+                    "asset_id": {"type": "integer", "minimum": 0, "default": 0},
+                    "include_escape_proof": {"type": "boolean", "default": False},
+                    "pending": {"type": "boolean", "default": False},
+                    "expected_escape_merkle_root": {"type": "string"},
+                    "verify_from_onchain_logs": {"type": "boolean", "default": False},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 50},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_login_wallet",
+            "description": "Authenticate an Ethereum wallet via EIP-191 challenge/signature into this MCP session (secrets are bound internally and never echoed back).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "generate_ephemeral": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_configure_risk_guardrails",
+            "description": "Configure agent risk limits: portfolio drawdown kill-switch, per-position Knock-Out barrier, Rolling MMP, and TCP Cancel-on-Disconnect.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "account_id": {"type": "integer", "minimum": 1},
+                    "drawdown_stop_usd": {"type": ["string", "number"]},
+                    "drawdown_stop_usd_micro": {"type": "integer", "minimum": 0},
+                    "knockout_symbol": {"type": "string"},
+                    "knockout_market_id": {"type": "integer", "minimum": 1},
+                    "knockout_price_usd": {"type": ["string", "number"]},
+                    "knockout_price_ticks": {"type": "integer", "minimum": 0},
+                    "mmp_window_wal_seqs": {"type": "integer", "minimum": 0, "maximum": 65535},
+                    "mmp_max_fill_lots": {"type": "integer", "minimum": 0},
+                    "mmp_max_delta_lots": {"type": "integer", "minimum": 0},
+                    "mmp_cooldown_wal_seqs": {"type": "integer", "minimum": 0, "maximum": 65535},
+                    "cancel_on_disconnect": {"type": "boolean"},
+                    "cod_market_id": {"type": "integer", "minimum": 0, "maximum": 65535, "default": 0},
+                    "cod_timeout_ms": {"type": "integer", "minimum": 0, "maximum": 86400000, "default": 0},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_manage_prime_subaccount",
+            "description": "Link, unlink (max_guaranty=-2), or execute 0-bps internal USD/base transfers between Prime master and sub-accounts.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["action"],
+                "properties": {
+                    "action": {"type": "string", "enum": ["link", "unlink", "transfer"]},
+                    "master_account_id": {"type": "integer", "minimum": 1},
+                    "sub_account_id": {"type": "integer", "minimum": 1},
+                    "max_guaranty_usd": {"type": ["string", "number"]},
+                    "max_guaranty_usd_micro": {"type": "integer", "minimum": -2},
+                    "from_account_id": {"type": "integer", "minimum": 1},
+                    "to_account_id": {"type": "integer", "minimum": 1},
+                    "asset_id": {"type": "integer", "minimum": 0, "default": 0},
+                    "amount_usd": {"type": ["string", "number"]},
+                    "amount_base": {"type": ["string", "number"]},
+                    "amount": {"type": "integer", "minimum": 1},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_bind_builder",
+            "description": "Bind a trader account to a Builder / Order-Flow Router account and protocol cut share (0..5000 bps).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["builder_account_id", "builder_fee_share_bps"],
+                "properties": {
+                    "trader_account_id": {"type": "integer", "minimum": 1},
+                    "builder_account_id": {"type": "integer", "minimum": 0},
+                    "builder_fee_share_bps": {"type": "integer", "minimum": 0, "maximum": 5000},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_place_order",
+            "description": "Submit a limit/market/pegged/IOC/FOK/PostOnly/reduce-only order using exact USD/base or fixed-point tick/lot units over HTTP or 64B TCP wire.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["side"],
+                "properties": {
+                    "account_id": {"type": "integer", "minimum": 1},
+                    "symbol": {"type": "string"},
+                    "market_id": {"type": "integer", "minimum": 1},
+                    "side": {"type": "string", "enum": ["buy", "sell", "bid", "ask"]},
+                    "price_usd": {"type": ["string", "number"]},
+                    "price_ticks": {"type": "integer"},
+                    "amount_base": {"type": ["string", "number"]},
+                    "qty_lots": {"type": "integer", "minimum": 1},
+                    "tif": {"type": "string", "enum": ["gtc", "ioc", "fok", "post_only"], "default": "gtc"},
+                    "stp": {"type": "string", "enum": ["cancel_resting", "cancel_incoming", "cancel_both", "decrement_and_cancel", "none"], "default": "cancel_resting"},
+                    "is_market": {"type": "boolean", "default": False},
+                    "reduce_only": {"type": "boolean", "default": False},
+                    "margin_spot": {"type": "boolean", "default": False},
+                    "post_only_slide": {"type": "boolean", "default": False},
+                    "primary_peg": {"type": "boolean", "default": False},
+                    "midpoint_peg": {"type": "boolean", "default": False},
+                    "mark_peg": {"type": "boolean", "default": False},
+                    "trailing_peg": {"type": "boolean", "default": False},
+                    "dark_midpoint": {"type": "boolean", "default": False},
+                    "oco_linked": {"type": "boolean", "default": False},
+                    "stp_decrement_and_cancel": {"type": "boolean", "default": False},
+                    "client_tag": {"type": "integer", "minimum": 0, "default": 0},
+                    "min_qty_lots": {"type": "integer", "minimum": 0, "default": 0},
+                    "display_qty_lots": {"type": "integer", "minimum": 0, "default": 0},
+                    "auto_skew_ticks": {"type": "integer", "minimum": 0, "maximum": 500, "default": 0},
+                    "auto_flip_ticks": {"type": "integer", "minimum": 0, "maximum": 500, "default": 0},
+                    "peg_offset_ticks": {"type": "integer", "minimum": -500, "maximum": 500, "default": 0},
+                    "max_lifetime_wal_seqs": {"type": "integer", "minimum": 0, "maximum": 65535, "default": 0},
+                    "jit_elastic_mult": {"type": "integer", "minimum": 0, "maximum": 50, "default": 0},
+                    "priority_fee_ppm": {"type": "integer", "minimum": 0, "maximum": 50000, "default": 0},
+                    "use_binary_wire": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_replace_two_sided_quote",
+            "description": "Atomically replace both resting Bid and Ask quotes on a market via HTTP POST /quote or 64-byte TCP TwoSidedQuoteReplace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "account_id": {"type": "integer", "minimum": 1},
+                    "symbol": {"type": "string"},
+                    "market_id": {"type": "integer", "minimum": 1},
+                    "bid_price_usd": {"type": ["string", "number"]},
+                    "bid_price_ticks": {"type": "integer"},
+                    "bid_amount_base": {"type": ["string", "number"]},
+                    "bid_qty_lots": {"type": "integer", "minimum": 0},
+                    "ask_price_usd": {"type": ["string", "number"]},
+                    "ask_price_ticks": {"type": "integer"},
+                    "ask_amount_base": {"type": ["string", "number"]},
+                    "ask_qty_lots": {"type": "integer", "minimum": 0},
+                    "tif": {"type": "string", "enum": ["gtc", "post_only", "postonly", "ioc", "fok"], "default": "gtc"},
+                    "stp": {"type": "string", "enum": ["cancel_resting", "cancel_incoming", "cancel_aggressor", "cancel_both", "none"], "default": "cancel_resting"},
+                    "post_only_slide": {"type": "boolean", "default": False},
+                    "margin_spot": {"type": "boolean", "default": False},
+                    "client_tag": {"type": "integer", "minimum": 0, "default": 0},
+                    "auto_skew_ticks": {"type": "integer", "minimum": 0, "maximum": 500, "default": 0},
+                    "auto_flip_ticks": {"type": "integer", "minimum": 0, "maximum": 500, "default": 0},
+                    "quote_peg_mode": {"type": "integer", "minimum": 0, "maximum": 4, "default": 0},
+                    "peg_offset_ticks": {"type": "integer", "minimum": -500, "maximum": 500, "default": 0},
+                    "oco_linked": {"type": "boolean", "default": False},
+                    "max_lifetime_wal_seqs": {"type": "integer", "minimum": 0, "maximum": 65535, "default": 0},
+                    "jit_elastic_mult": {"type": "integer", "minimum": 0, "maximum": 50, "default": 0},
+                    "ladder_by_tag": {"type": "boolean", "default": False},
+                    "use_binary_wire": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_modify_order",
+            "description": "Modify an existing resting order price and/or quantity with optional FIFO keep_priority.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["order_id"],
+                "properties": {
+                    "account_id": {"type": "integer", "minimum": 1},
+                    "symbol": {"type": "string"},
+                    "market_id": {"type": "integer", "minimum": 1},
+                    "order_id": {"type": "integer", "minimum": 1},
+                    "price_usd": {"type": ["string", "number"]},
+                    "price_ticks": {"type": "integer"},
+                    "amount_base": {"type": ["string", "number"]},
+                    "qty_lots": {"type": "integer", "minimum": 1},
+                    "keep_priority": {"type": "boolean", "default": False},
+                    "use_binary_wire": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_cancel_orders",
+            "description": "Cancel a specific resting order by order_id or batch-cancel orders by market, side, client_tag_filter, or market_bitmask.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "account_id": {"type": "integer", "minimum": 1},
+                    "symbol": {"type": "string"},
+                    "market_id": {"type": "integer", "minimum": 0, "default": 0},
+                    "order_id": {"type": "integer", "minimum": 0, "default": 0},
+                    "cancel_all": {"type": "boolean", "default": False},
+                    "side": {"type": "string", "enum": ["", "bid", "ask", "buy", "sell"], "default": ""},
+                    "client_tag_filter": {"type": "integer", "minimum": 0, "default": 0},
+                    "market_bitmask": {"type": "integer", "minimum": 0, "default": 0},
+                    "use_binary_wire": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_execute_atomic_basket",
+            "description": "Execute an all-or-nothing 2..4-leg atomic cross-market basket / spread trade via POST /basket.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["legs"],
+                "properties": {
+                    "account_id": {"type": "integer", "minimum": 1},
+                    "stp": {"type": "string", "enum": ["cancel_resting", "cancel_incoming", "cancel_both", "none"], "default": "cancel_resting"},
+                    "margin_spot": {"type": "boolean", "default": False},
+                    "client_tag": {"type": "integer", "minimum": 0, "default": 0},
+                    "express_surplus_bid_bps": {"type": "integer", "minimum": 0, "maximum": 5000, "default": 0},
+                    "legs": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "required": ["side"],
+                            "properties": {
+                                "symbol": {"type": "string"},
+                                "market_id": {"type": "integer", "minimum": 1},
+                                "side": {"type": "string", "enum": ["buy", "sell", "bid", "ask"]},
+                                "price_usd": {"type": ["string", "number"]},
+                                "price_ticks": {"type": "integer"},
+                                "amount_base": {"type": ["string", "number"]},
+                                "qty_lots": {"type": "integer", "minimum": 1},
+                                "is_market": {"type": "boolean", "default": False},
+                                "reduce_only": {"type": "boolean", "default": False},
+                                "margin_spot": {"type": "boolean", "default": False},
+                            },
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_portfolio_delta_hedge",
+            "description": "Execute a 1-frame Jacobian residual delta-neutralizing hedge via POST /auto_delta_hedge.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "account_id": {"type": "integer", "minimum": 1},
+                    "base_asset_id": {"type": "integer", "minimum": 0, "default": 0},
+                    "preferred_market_id": {"type": "integer", "minimum": 0, "default": 0},
+                    "max_slippage_bps": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 200},
+                    "max_qty_lots": {"type": "integer", "minimum": 0, "default": 0},
+                    "margin_spot": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_request_withdrawal",
+            "description": "Request an off-chain debit + operator-signed ARENA_WITHDRAW_V1_4 voucher (blocked unless --allow-withdrawals is explicitly enabled).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["recipient_eth_address"],
+                "properties": {
+                    "account_id": {"type": "integer", "minimum": 1},
+                    "asset_id": {"type": "integer", "minimum": 0, "default": 0},
+                    "amount_usd": {"type": ["string", "number"]},
+                    "amount_base": {"type": ["string", "number"]},
+                    "amount": {"type": "integer", "minimum": 1},
+                    "recipient_eth_address": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_subscribe_express_port",
+            "description": "Purchase or extend a Native Colocation Express Port lease (epochs) for priority wire tie-break and max Core 1 ingress batching.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "account_id": {"type": "integer", "minimum": 1},
+                    "duration_epochs": {"type": "integer", "minimum": 1, "maximum": 1051200, "default": 1},
+                    "max_fee_usd_micro": {"type": "integer", "minimum": 0, "default": 0},
+                    "use_binary_wire": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_preview_order",
+            "description": "Stateless dry-run order simulation via POST /order/preview (zero WAL, L3 book, or balance mutation). Returns estimated fills, resting lots, net fee/rebate, and pre/post Eigen-SPAN IMR/MMR/free margin.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["side"],
+                "properties": {
+                    "account_id": {"type": "integer", "minimum": 1},
+                    "symbol": {"type": "string"},
+                    "market_id": {"type": "integer", "minimum": 1},
+                    "side": {"type": "string", "enum": ["buy", "sell", "bid", "ask"]},
+                    "price_usd": {"type": ["string", "number"]},
+                    "price_ticks": {"type": "integer"},
+                    "differential_usd": {"type": ["string", "number"]},
+                    "amount_base": {"type": ["string", "number"]},
+                    "qty_lots": {"type": "integer", "minimum": 1},
+                    "tif": {"type": "string", "enum": ["gtc", "ioc", "fok", "post_only"], "default": "gtc"},
+                    "stp": {"type": "string", "enum": ["cancel_resting", "cancel_incoming", "cancel_both", "decrement_and_cancel", "none"], "default": "cancel_resting"},
+                    "is_market": {"type": "boolean", "default": False},
+                    "reduce_only": {"type": "boolean", "default": False},
+                    "margin_spot": {"type": "boolean", "default": False},
+                    "post_only_slide": {"type": "boolean", "default": False},
+                    "primary_peg": {"type": "boolean", "default": False},
+                    "midpoint_peg": {"type": "boolean", "default": False},
+                    "mark_peg": {"type": "boolean", "default": False},
+                    "trailing_peg": {"type": "boolean", "default": False},
+                    "dark_midpoint": {"type": "boolean", "default": False},
+                    "oco_linked": {"type": "boolean", "default": False},
+                    "stp_decrement_and_cancel": {"type": "boolean", "default": False},
+                    "client_tag": {"type": "integer", "minimum": 0, "default": 0},
+                    "min_qty_lots": {"type": "integer", "minimum": 0, "default": 0},
+                    "display_qty_lots": {"type": "integer", "minimum": 0, "default": 0},
+                    "auto_skew_ticks": {"type": "integer", "minimum": 0, "maximum": 500, "default": 0},
+                    "auto_flip_ticks": {"type": "integer", "minimum": 0, "maximum": 500, "default": 0},
+                    "peg_offset_ticks": {"type": "integer", "minimum": -500, "maximum": 500, "default": 0},
+                    "max_lifetime_wal_seqs": {"type": "integer", "minimum": 0, "maximum": 65535, "default": 0},
+                    "jit_elastic_mult": {"type": "integer", "minimum": 0, "maximum": 50, "default": 0},
+                    "priority_fee_ppm": {"type": "integer", "minimum": 0, "maximum": 50000, "default": 0},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_flash_arbitrage",
+            "description": "Execute zero-pre-margin intra-tick atomic Flash Arbitrage (mint+sell or buy+burn/redeem) on a Bonding-Curve Spot or BoundedClaim market via POST /flash_arb or 64B TCP wire.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["side"],
+                "properties": {
+                    "account_id": {"type": "integer", "minimum": 1},
+                    "symbol": {"type": "string"},
+                    "market_id": {"type": "integer", "minimum": 1},
+                    "side": {
+                        "type": "string",
+                        "enum": ["buy", "sell", "bid", "ask", "mint", "redeem", "mint_and_sell", "buy_and_redeem"],
+                    },
+                    "amount_base": {"type": ["string", "number"]},
+                    "qty_lots": {"type": "integer", "minimum": 1},
+                    "limit_price_usd": {"type": ["string", "number"]},
+                    "limit_price_ticks": {"type": "integer", "default": 0},
+                    "min_profit_usd": {"type": ["string", "number"]},
+                    "min_profit_micro": {"type": "integer", "default": 0},
+                    "is_market": {"type": "boolean", "default": True},
+                    "stp": {"type": "string", "enum": ["cancel_resting", "cancel_incoming", "cancel_both", "none"], "default": "cancel_resting"},
+                    "express_surplus_bid_bps": {"type": "integer", "minimum": 0, "maximum": 5000, "default": 0},
+                    "use_binary_wire": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_auto_liquidate",
+            "description": "Execute an autonomous zero-capital liquidation & backstop bounty sweep across underwater accounts via POST /auto_liquidate.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "liquidator_account_id": {"type": "integer", "minimum": 1},
+                    "market_id": {"type": "integer", "minimum": 0, "default": 0},
+                    "target_account_id": {"type": "integer", "minimum": 0, "default": 0},
+                    "max_lots": {"type": "integer", "minimum": 0, "default": 0},
+                    "min_bounty_usd": {"type": ["string", "number"]},
+                    "min_bounty_micro": {"type": "integer", "default": 0},
+                    "flash_offload_to_book": {"type": "boolean", "default": True},
+                    "stp": {"type": "string", "enum": ["cancel_resting", "cancel_incoming", "cancel_both", "none"], "default": "cancel_resting"},
+                    "hedge_margin_spot": {"type": "boolean", "default": False},
+                    "bounty_rebate_bid_bps": {"type": "integer", "minimum": 0, "maximum": 9000, "default": 0},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "arena_onboard_and_deposit",
+            "description": "Self-service AI agent onboarding: logs in or generates an ephemeral EIP-191 wallet, optionally requests testnet collateral from POST /faucet, and optionally deposits ERC-20 margin on-chain into Clearinghouse.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "generate_ephemeral": {"type": "boolean", "default": False},
+                    "request_faucet": {"type": "boolean", "default": True},
+                    "faucet_amount": {"type": ["string", "number"], "default": "10000"},
+                    "asset_symbol": {"type": "string", "default": "USD"},
+                    "drip_gas": {"type": "boolean", "default": True},
+                    "deposit_onchain": {"type": "boolean", "default": False},
+                    "deposit_amount": {"type": ["string", "number"]},
+                    "rpc_url": {"type": "string", "default": ""},
+                    "wait_for_credit": {"type": "boolean", "default": True},
+                    "poll_timeout_sec": {"type": "number", "minimum": 0.5, "maximum": 120.0, "default": 30.0},
+                },
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+
+class ArenaMcpGateway:
+    """Policy-enforcing MCP server handler wired to a real ArenaHttpClient/ArenaBinaryClient."""
+
+    def __init__(
+        self,
+        *,
+        arena_url: str = "http://127.0.0.1:8080",
+        tcp_host: str = "",
+        tcp_port: int = 0,
+        account_id: int = 0,
+        api_key: Optional[str] = None,
+        api_secret: Optional[str] = None,
+        creds_file: Optional[str | Path] = None,
+        wallet_privkey_hex: Optional[str] = None,
+        rpc_url: str = "",
+        clearinghouse: str = "",
+        expected_operator_address: str = "",
+        read_only: bool = False,
+        allowed_accounts: Optional[frozenset[int]] = None,
+        max_order_notional_micro: int = 0,
+        require_drawdown_stop: bool = False,
+        min_drawdown_stop_micro: int = 0,
+        default_builder_account: int = 0,
+        default_builder_bps: int = 0,
+        allow_withdrawals: bool = False,
+        allowed_withdrawal_recipients: Optional[frozenset[str]] = None,
+        allow_wallet_login: bool = False,
+        timeout: float = 5.0,
+    ) -> None:
+        if default_builder_bps < 0 or default_builder_bps > MAX_BUILDER_FEE_SHARE_BPS:
+            raise ValueError(
+                f"default_builder_bps {default_builder_bps} out of [0, {MAX_BUILDER_FEE_SHARE_BPS}]"
+            )
+        if int(min_drawdown_stop_micro) < 0:
+            raise ValueError(f"min_drawdown_stop_micro must be >= 0, got {min_drawdown_stop_micro}")
+        self.read_only = bool(read_only)
+        self.allowed_accounts = allowed_accounts
+        self.max_order_notional_micro = int(max_order_notional_micro)
+        self.min_drawdown_stop_micro = int(min_drawdown_stop_micro)
+        self.require_drawdown_stop = bool(require_drawdown_stop or self.min_drawdown_stop_micro > 0)
+        self.default_builder_account = int(default_builder_account)
+        self.default_builder_bps = int(default_builder_bps)
+        self.allow_withdrawals = bool(allow_withdrawals)
+        self.allowed_withdrawal_recipients = allowed_withdrawal_recipients
+        self.allow_wallet_login = bool(allow_wallet_login)
+        self._static_creds_configured = bool(api_key or api_secret or creds_file or wallet_privkey_hex)
+        self.rpc_url = str(rpc_url or "").strip()
+        self.clearinghouse = str(clearinghouse or "").strip()
+        self.expected_operator_address = str(expected_operator_address or "").strip()
+        self._wallet_privkey_hex = str(wallet_privkey_hex or "").strip()
+        self._builder_bound_accounts: set[int] = set()
+        self._initialized = False
+        self._dispatch_lock = threading.RLock()
+
+        self.adapter = ArenaCcxtAdapter(
+            arena_url,
+            account_id=account_id,
+            api_key=api_key,
+            api_secret=api_secret,
+            creds_file=creds_file,
+            wallet_privkey_hex=(None if self.read_only else (self._wallet_privkey_hex or None)),
+            tcp_host=tcp_host or None,
+            tcp_port=tcp_port,
+            timeout=timeout,
+        )
+
+    def _has_binary_wire(self) -> bool:
+        return int(getattr(self.adapter, "_tcp_port", 0)) > 0 or getattr(self.adapter, "binary", None) is not None
+
+    @staticmethod
+    def _is_public_global_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+        mapped = getattr(ip_obj, "ipv4_mapped", None)
+        chk = mapped if mapped is not None else ip_obj
+        return bool(
+            chk.is_global
+            and not chk.is_private
+            and not chk.is_loopback
+            and not chk.is_link_local
+            and not chk.is_multicast
+            and not chk.is_unspecified
+            and not chk.is_reserved
+        )
+
+    def _validate_caller_rpc_url(self, caller_rpc: str) -> str:
+        raw = str(caller_rpc or "").strip()
+        if self.rpc_url:
+            if raw and raw != self.rpc_url:
+                raise PermissionError("rpc_url_override_disallowed: operator --rpc-url is locked")
+            return self.rpc_url
+        if not raw:
+            return ""
+        parsed = urllib.parse.urlsplit(raw)
+        scheme = parsed.scheme.lower()
+        if scheme != "https":
+            raise PermissionError("unsafe_rpc_url: caller rpc_url override must use https://")
+        if parsed.username or parsed.password:
+            raise PermissionError("unsafe_rpc_url: credentials disallowed in caller rpc_url")
+        host = (parsed.hostname or "").strip().lower().rstrip(".")
+        if not host:
+            raise ValueError(f"Invalid rpc_url host: {raw!r}")
+        if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+            raise PermissionError("unsafe_rpc_url: local/internal hostname disallowed")
+        try:
+            ip_obj = ipaddress.ip_address(host)
+        except ValueError:
+            ip_obj = None
+        if ip_obj is not None:
+            if not self._is_public_global_ip(ip_obj):
+                raise PermissionError("unsafe_rpc_url: non-global or reserved IP literal disallowed")
+            return raw
+        if all(part.isdigit() or part.startswith("0x") for part in host.split(".") if part):
+            raise PermissionError("unsafe_rpc_url: non-canonical numeric IP host disallowed")
+        try:
+            infos = socket.getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise PermissionError(f"unsafe_rpc_url: DNS resolution failed for {host!r}") from exc
+        if not infos:
+            raise PermissionError(f"unsafe_rpc_url: empty DNS resolution for {host!r}")
+        for info in infos:
+            resolved_ip_str = str(info[4][0]).split("%", 1)[0]
+            resolved_ip = ipaddress.ip_address(resolved_ip_str)
+            if not self._is_public_global_ip(resolved_ip):
+                raise PermissionError("unsafe_rpc_url: hostname resolves to non-global IP address")
+        return raw
+
+    def close(self) -> None:
+        self.adapter.close()
+
+    def _effective_account(self, explicit_aid: Optional[int]) -> int:
+        aid = int(explicit_aid) if explicit_aid is not None else int(self.adapter.account_id)
+        if aid <= 0:
+            raise ValueError("account_id required (pass account_id, --account-id, or run arena_login_wallet)")
+        if self.allowed_accounts is not None and aid not in self.allowed_accounts:
+            raise PermissionError(f"account_not_in_allowed_accounts: {aid}")
+        return aid
+
+    def _check_account_allowlist(self, aid: int) -> None:
+        if self.allowed_accounts is not None and int(aid) not in self.allowed_accounts:
+            raise PermissionError(f"account_not_in_allowed_accounts: {aid}")
+
+    def _resolve_market_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        if args.get("symbol"):
+            return self.adapter.resolve_market(str(args["symbol"]))
+        if args.get("market_id") is not None:
+            return self.adapter.resolve_market(int(args["market_id"]))
+        raise ValueError("Either symbol or market_id must be provided")
+
+    def _resolve_price_ticks(
+        self,
+        args: Dict[str, Any],
+        market: Dict[str, Any],
+        *,
+        usd_key: str = "price_usd",
+        ticks_key: str = "price_ticks",
+        allow_zero: bool = False,
+    ) -> int:
+        is_spread = str(market.get("kind", "")).lower() == "spread_book"
+        if ticks_key in args and args[ticks_key] is not None:
+            px = int(args[ticks_key])
+            if not allow_zero and not is_spread and px <= 0:
+                raise ValueError(f"{ticks_key} must be > 0 for non-spread market")
+            return px
+        if usd_key in args and args[usd_key] is not None:
+            return usd_to_price_ticks(args[usd_key], allow_zero=(allow_zero or is_spread), allow_negative=is_spread)
+        if allow_zero:
+            return 0
+        raise ValueError(f"Either {usd_key} or {ticks_key} must be provided")
+
+    def _resolve_qty_lots(
+        self,
+        args: Dict[str, Any],
+        *,
+        base_key: str = "amount_base",
+        lots_key: str = "qty_lots",
+        allow_zero: bool = False,
+    ) -> int:
+        if lots_key in args and args[lots_key] is not None:
+            q = int(args[lots_key])
+            if (not allow_zero and q <= 0) or q < 0 or q > MAX_WIRE_HEADER_QTY_LOTS:
+                raise ValueError(f"{lots_key} {q} out of valid wire bounds")
+            return q
+        if base_key in args and args[base_key] is not None:
+            return base_to_qty_lots(args[base_key], allow_zero=allow_zero)
+        raise ValueError(f"Either {base_key} or {lots_key} must be provided")
+
+    def _lookup_ref_ticks(self, market_id: int, side_str: str) -> int:
+        _ = side_str
+        book_resp = self.adapter.http.book(market_id, depth=1)
+        if book_resp.get("ok"):
+            best = max(
+                abs(int(book_resp.get("best_ask_ticks", 0))),
+                abs(int(book_resp.get("mark_price_ticks", 0))),
+                abs(int(book_resp.get("best_bid_ticks", 0))),
+            )
+            if best > 0:
+                return best
+        tk_resp = self.adapter.http.ticker(market_id)
+        if tk_resp.get("ok") and isinstance(tk_resp.get("ticker"), dict):
+            tk = tk_resp["ticker"]
+            best_tk = max(
+                abs(int(tk.get("mark_price_ticks", 0))),
+                abs(int(tk.get("best_ask_ticks", 0))),
+                abs(int(tk.get("best_bid_ticks", 0))),
+                abs(int(tk.get("last_trade_price_ticks", 0))),
+            )
+            if best_tk > 0:
+                return best_tk
+        return 0
+
+    def _effective_min_drawdown_stop_micro(self) -> int:
+        if not self.require_drawdown_stop:
+            return 0
+        return max(self.min_drawdown_stop_micro, 1_000_000)
+
+    def _enforce_notional_cap(
+        self,
+        *,
+        market: Dict[str, Any],
+        side_str: str,
+        price_ticks: int,
+        qty_lots: int,
+        reduce_only: bool,
+        is_pegged_or_market: bool,
+        jit_elastic_mult: int = 0,
+        margin_spot: bool = False,
+        is_visible_iceberg: bool = False,
+        peg_offset_ticks: int = 0,
+    ) -> int:
+        jit_mult_in = int(jit_elastic_mult)
+        if jit_mult_in < 0:
+            raise ValueError(f"jit_elastic_mult must be >= 0, got {jit_mult_in}")
+        if self.max_order_notional_micro <= 0 or reduce_only or qty_lots <= 0:
+            return 0
+        mid = int(market["market_id"])
+        is_spread = str(market.get("kind", "")).lower() == "spread_book"
+        norm_side = str(side_str or "").strip().lower()
+        if is_spread:
+            ref_list = market.get("ref_markets") if isinstance(market.get("ref_markets"), (list, tuple)) else []
+            leg1 = int(
+                market.get("ref_market_1", 0)
+                or (ref_list[0] if len(ref_list) >= 1 else 0)
+                or market.get("leg1_market_id", 0)
+            )
+            leg2 = int(
+                market.get("ref_market_2", 0)
+                or (ref_list[1] if len(ref_list) >= 2 else 0)
+                or market.get("leg2_market_id", 0)
+            )
+            leg3 = int(
+                market.get("ref_market_3", 0)
+                or (ref_list[2] if len(ref_list) >= 3 else 0)
+            )
+            if leg1 <= 0 or leg2 <= 0:
+                raise PermissionError(
+                    f"max_order_notional_exceeded: unavailable spread leg metadata on spread_book market {mid}"
+                )
+            gross_leg_ticks = 0
+            for leg_mid in ([leg1, leg2] + ([leg3] if leg3 > 0 else [])):
+                leg_ref = max(
+                    self._lookup_ref_ticks(leg_mid, "bid"),
+                    self._lookup_ref_ticks(leg_mid, "ask"),
+                )
+                if leg_ref <= 0:
+                    raise PermissionError(
+                        f"max_order_notional_exceeded: unavailable leg {leg_mid} reference price for spread_book market {mid}"
+                    )
+                gross_leg_ticks += leg_ref
+            eff_ticks = max(gross_leg_ticks, abs(price_ticks))
+        else:
+            need_ref = is_pegged_or_market or price_ticks == 0 or (norm_side in ("ask", "sell"))
+            if not need_ref:
+                eff_ticks = abs(price_ticks)
+            else:
+                ref = self._lookup_ref_ticks(mid, norm_side)
+                if ref > 0:
+                    eff_ticks = max(abs(price_ticks), ref)
+                elif price_ticks != 0 and not is_pegged_or_market:
+                    eff_ticks = abs(price_ticks)
+                else:
+                    raise PermissionError(
+                        f"max_order_notional_exceeded: unavailable reference price on market {mid}"
+                    )
+        if is_pegged_or_market and int(peg_offset_ticks) > 0:
+            eff_ticks += int(peg_offset_ticks)
+        eff_jit_mult = (
+            min(jit_mult_in, 50)
+            if (jit_mult_in >= 2 and not reduce_only and not margin_spot and not is_visible_iceberg)
+            else 1
+        )
+        notional_micro = eff_ticks * qty_lots * eff_jit_mult
+        if notional_micro > self.max_order_notional_micro:
+            raise PermissionError(
+                f"max_order_notional_exceeded: order notional ${micro_to_usd_str(notional_micro)} "
+                f"exceeds cap ${micro_to_usd_str(self.max_order_notional_micro)}"
+            )
+        return notional_micro
+
+    def _enforce_delta_hedge_notional_cap(
+        self,
+        *,
+        aid: int,
+        acct_snap: Optional[Dict[str, Any]],
+        base_asset_id: int,
+        preferred_market_id: int,
+        max_qty_lots: int,
+        max_slippage_bps: int = 200,
+    ) -> None:
+        if self.max_order_notional_micro <= 0:
+            return
+        if max_qty_lots < 0:
+            raise ValueError(f"max_qty_lots must be >= 0, got {max_qty_lots}")
+        raw_slip = int(max_slippage_bps)
+        if raw_slip < 0:
+            raise ValueError(f"max_slippage_bps must be >= 0, got {raw_slip}")
+        eff_slip_bps = 500 if raw_slip == 0 else min(raw_slip, 5_000)
+
+        def _with_slip(notional: int) -> int:
+            if notional <= 0:
+                return 0
+            return (notional * (10_000 + eff_slip_bps) + 9_999) // 10_000
+
+        reloaded_mkts = False
+
+        def _refresh_markets_once(ctx_label: str) -> None:
+            nonlocal reloaded_mkts
+            if reloaded_mkts:
+                return
+            reloaded_mkts = True
+            try:
+                self.adapter.load_markets(reload=True)
+            except Exception as mkt_exc:
+                if not self.adapter.markets_by_id:
+                    raise PermissionError(
+                        f"max_order_notional_exceeded: unavailable market metadata for {ctx_label} ({mkt_exc})"
+                    ) from mkt_exc
+
+        def _get_market_info(mid: int) -> Dict[str, Any]:
+            if mid not in self.adapter.markets_by_id:
+                _refresh_markets_once("hedge sizing")
+            entry = self.adapter.markets_by_id.get(mid)
+            if isinstance(entry, dict) and isinstance(entry.get("info"), dict):
+                return dict(entry["info"])
+            return {}
+
+        def _market_base_asset_id(mid: int) -> int:
+            return int(_get_market_info(mid).get("base_asset_id", 0))
+
+        def _expand_formula_asset_deltas(mid: int, signed_notional_micro: int, depth: int = 0) -> List[tuple[int, int]]:
+            if signed_notional_micro == 0:
+                return []
+            info = _get_market_info(mid) if mid > 0 else {}
+            mkt_base_aid = int(info.get("base_asset_id", 0))
+            kind = _canonical_market_kind(info.get("kind", ""))
+            fkind = str(info.get("formula_kind", "")).lower()
+            ref_list = info.get("ref_markets") if isinstance(info.get("ref_markets"), list) else []
+            refs = [
+                int(info.get(f"ref_market_{i + 1}", 0) or (ref_list[i] if len(ref_list) > i else 0))
+                for i in range(3)
+            ]
+            if depth < 8 and kind == "perp" and refs[0] > 0 and refs[0] != mid:
+                return _expand_formula_asset_deltas(refs[0], signed_notional_micro, depth + 1)
+            if depth < 8 and kind == "formula_perp":
+                if fkind == "power2" and refs[0] > 0:
+                    return _expand_formula_asset_deltas(refs[0], signed_notional_micro * 2, depth + 1)
+                if fkind == "power3" and refs[0] > 0:
+                    return _expand_formula_asset_deltas(refs[0], signed_notional_micro * 3, depth + 1)
+                if fkind == "ratio" and refs[0] > 0 and refs[1] > 0:
+                    return (
+                        _expand_formula_asset_deltas(refs[0], signed_notional_micro, depth + 1)
+                        + _expand_formula_asset_deltas(refs[1], -signed_notional_micro, depth + 1)
+                    )
+                if fkind == "linear_spread":
+                    weights = info.get("weights_centi") if isinstance(info.get("weights_centi"), list) else []
+                    nz = [
+                        (refs[k], int(weights[k]))
+                        for k in range(3)
+                        if refs[k] > 0 and k < len(weights) and int(weights[k]) != 0
+                    ]
+                    if nz:
+                        f_mark = abs(self._lookup_ref_ticks(mid, "bid"))
+                        leg_marks = [abs(self._lookup_ref_ticks(rk, "bid")) for rk, _ in nz]
+                        out_ls: List[tuple[int, int]] = []
+                        if f_mark > 0 and all(sm > 0 for sm in leg_marks):
+                            denom = 100 * f_mark
+                            for (rk, wk), sm in zip(nz, leg_marks):
+                                out_ls.extend(
+                                    _expand_formula_asset_deltas(
+                                        rk, (signed_notional_micro * wk * sm) // denom, depth + 1
+                                    )
+                                )
+                        else:
+                            for rk, wk in nz:
+                                leg_d = signed_notional_micro if wk >= 0 else -signed_notional_micro
+                                out_ls.extend(_expand_formula_asset_deltas(rk, leg_d, depth + 1))
+                        if out_ls:
+                            return out_ls
+                if fkind == "funding_and_carry_index" and refs[0] > 0 and refs[1] > 0:
+                    weights = info.get("weights_centi") if isinstance(info.get("weights_centi"), list) else []
+                    w1 = int(weights[1]) if len(weights) >= 2 and int(weights[1]) != 0 else 100
+                    f_mark = abs(self._lookup_ref_ticks(mid, "bid"))
+                    s0 = abs(self._lookup_ref_ticks(refs[0], "bid"))
+                    s1 = abs(self._lookup_ref_ticks(refs[1], "bid"))
+                    if f_mark > 0 and s0 > 0 and s1 > 0:
+                        denom = 100 * f_mark
+                        return (
+                            _expand_formula_asset_deltas(refs[0], (signed_notional_micro * w1 * s0) // denom, depth + 1)
+                            + _expand_formula_asset_deltas(refs[1], -(signed_notional_micro * w1 * s1) // denom, depth + 1)
+                        )
+                    return (
+                        _expand_formula_asset_deltas(refs[0], signed_notional_micro, depth + 1)
+                        + _expand_formula_asset_deltas(refs[1], -signed_notional_micro, depth + 1)
+                    )
+                fallback_legs: List[tuple[int, int]] = []
+                for rk in refs:
+                    if rk > 0 and rk != mid:
+                        fallback_legs.extend(_expand_formula_asset_deltas(rk, signed_notional_micro, depth + 1))
+                if fallback_legs:
+                    return fallback_legs
+            return [(mkt_base_aid, signed_notional_micro)]
+
+        def _collect_cand_mids_for_asset(s_aid: int, side_for_lookup: str = "bid") -> int:
+            if not self.adapter.markets_by_id:
+                _refresh_markets_once("spot hedge sizing")
+            pref_entry = self.adapter.markets_by_id.get(preferred_market_id)
+            pref_kind = str((pref_entry.get("info") or {}).get("kind", "")).lower() if isinstance(pref_entry, dict) else ""
+
+            def _cand_list() -> List[int]:
+                mids_out: List[int] = []
+                if preferred_market_id > 0 and _market_base_asset_id(preferred_market_id) == s_aid and pref_kind != "spread_book":
+                    mids_out.append(int(preferred_market_id))
+                for prefer_kinds in (("spot", "perp"), ("formula_perp",)):
+                    for mid_k, entry in self.adapter.markets_by_id.items():
+                        info = entry.get("info") if isinstance(entry, dict) else None
+                        if (
+                            isinstance(info, dict)
+                            and int(info.get("base_asset_id", 0)) == s_aid
+                            and _canonical_market_kind(info.get("kind", "")) in prefer_kinds
+                            and int(mid_k) not in mids_out
+                        ):
+                            mids_out.append(int(mid_k))
+                return mids_out
+
+            cands = _cand_list()
+            if not cands and not reloaded_mkts:
+                _refresh_markets_once("spot hedge sizing")
+                cands = _cand_list()
+            for cand_mid in cands:
+                px = self._lookup_ref_ticks(cand_mid, side_for_lookup)
+                if px > 0:
+                    return px
+            return 0
+
+        if preferred_market_id > 0 and max_qty_lots > 0:
+            ref = self._lookup_ref_ticks(preferred_market_id, "bid")
+            if ref <= 0:
+                raise PermissionError(
+                    f"max_order_notional_exceeded: unavailable reference price on market {preferred_market_id}"
+                )
+            est = _with_slip(ref * max_qty_lots)
+            if est > self.max_order_notional_micro:
+                raise PermissionError(
+                    f"max_order_notional_exceeded: delta hedge notional ${micro_to_usd_str(est)} "
+                    f"exceeds cap ${micro_to_usd_str(self.max_order_notional_micro)}"
+                )
+            # Only return early when the server hedge is constrained to the same single base_asset_id;
+            # with base_asset_id == 0 the engine loops across all registered base assets up to max_qty_lots each.
+            if base_asset_id > 0 and _market_base_asset_id(preferred_market_id) == base_asset_id:
+                return
+
+        if acct_snap is None:
+            acct_snap = self.adapter.http.account(aid)
+            if not isinstance(acct_snap, dict) or not acct_snap.get("ok"):
+                raise RuntimeError(f"GET /account failed: {acct_snap}")
+
+        abs_delta_by_asset: Dict[int, int] = {}
+        asset_ref_px_hint: Dict[int, int] = {}
+
+        for pp in list(acct_snap.get("perp_positions", [])):
+            pos_lots = int(pp.get("position_lots", 0))
+            if pos_lots == 0:
+                continue
+            pmid = int(pp.get("market_id", 0))
+            ref_px = int(pp.get("mark_price_ticks", 0))
+            if ref_px <= 0 and pmid > 0:
+                ref_px = self._lookup_ref_ticks(pmid, "ask" if pos_lots > 0 else "bid")
+            if ref_px <= 0:
+                raise PermissionError(
+                    f"max_order_notional_exceeded: unavailable reference price on market {pmid}"
+                )
+            pp_baid = int(pp.get("base_asset_id", 0)) or _market_base_asset_id(pmid)
+            expanded = _expand_formula_asset_deltas(pmid, pos_lots * ref_px, 0)
+            for d_aid, d_micro in expanded:
+                eff_aid = d_aid if d_aid > 0 else pp_baid
+                if base_asset_id > 0 and eff_aid != base_asset_id:
+                    continue
+                if d_micro != 0:
+                    abs_delta_by_asset[eff_aid] = abs_delta_by_asset.get(eff_aid, 0) + abs(d_micro)
+                    if eff_aid == pp_baid and pp_baid > 0:
+                        asset_ref_px_hint.setdefault(eff_aid, ref_px)
+
+        base_holdings = (
+            acct_snap["base_balances"]
+            if "base_balances" in acct_snap
+            else acct_snap.get("spot_balances", [])
+        )
+        for sb in list(base_holdings or []):
+            s_aid = int(sb.get("asset_id", 0))
+            if base_asset_id > 0 and s_aid != base_asset_id:
+                continue
+            net_lots = int(sb.get("free_lots", 0)) + int(sb.get("locked_lots", 0)) - int(sb.get("borrowed_lots", 0))
+            if net_lots == 0:
+                continue
+            ref_px = int(sb.get("mark_price_ticks", 0))
+            if ref_px <= 0:
+                ref_px = _collect_cand_mids_for_asset(s_aid, "ask" if net_lots > 0 else "bid")
+            if ref_px <= 0:
+                raise PermissionError(
+                    f"max_order_notional_exceeded: unavailable reference price for asset_id={s_aid}"
+                )
+            abs_delta_by_asset[s_aid] = abs_delta_by_asset.get(s_aid, 0) + abs(net_lots) * ref_px
+            asset_ref_px_hint.setdefault(s_aid, ref_px)
+
+        total_notional = 0
+        for b_aid_key, raw_abs in abs_delta_by_asset.items():
+            eff_n = raw_abs
+            if max_qty_lots > 0:
+                a_ref = asset_ref_px_hint.get(b_aid_key, 0)
+                if a_ref <= 0:
+                    a_ref = _collect_cand_mids_for_asset(b_aid_key, "bid")
+                if a_ref > 0:
+                    eff_n = min(eff_n, max_qty_lots * a_ref)
+            total_notional += eff_n
+
+        worst_notional = _with_slip(total_notional)
+        if worst_notional > self.max_order_notional_micro:
+            raise PermissionError(
+                f"max_order_notional_exceeded: delta hedge notional ${micro_to_usd_str(worst_notional)} "
+                f"exceeds cap ${micro_to_usd_str(self.max_order_notional_micro)}"
+            )
+
+    def _preflight_risk_and_builder(self, aid: int, *, risk_increasing: bool) -> Optional[Dict[str, Any]]:
+        need_acct_fetch = (self.require_drawdown_stop and risk_increasing) or (
+            self.default_builder_account > 0
+            and self.default_builder_bps > 0
+            and aid != self.default_builder_account
+            and aid not in self._builder_bound_accounts
+        )
+        if not need_acct_fetch:
+            return None
+        acct = self.adapter.http.account(aid)
+        if not acct.get("ok"):
+            raise RuntimeError(f"GET /account preflight failed: {acct}")
+        if self.require_drawdown_stop and risk_increasing:
+            min_dd = self._effective_min_drawdown_stop_micro()
+            cur_dd = int(acct.get("drawdown_stop_equity_micro", 0))
+            if cur_dd < min_dd:
+                raise PermissionError(
+                    f"drawdown_stop_required_before_trading: account {aid} has "
+                    f"drawdown_stop_equity_micro={cur_dd} (< minimum {min_dd}); "
+                    "call arena_configure_risk_guardrails first"
+                )
+        if (
+            self.default_builder_account > 0
+            and self.default_builder_bps > 0
+            and aid != self.default_builder_account
+            and aid not in self._builder_bound_accounts
+        ):
+            cur_builder = int(acct.get("builder_account_id", 0))
+            if cur_builder == 0:
+                bres = self.adapter.http.bind_builder_code(
+                    aid, self.default_builder_account, self.default_builder_bps
+                )
+                if not bres.get("ok"):
+                    raise RuntimeError(f"Auto bind_builder_code failed: {bres}")
+            self._builder_bound_accounts.add(aid)
+        return acct
+
+    def _enforce_transfer_or_withdrawal_guardrails(
+        self,
+        *,
+        aid: int,
+        asset_id: int,
+        raw_amount: int,
+        op_label: str,
+    ) -> None:
+        amt_i = int(raw_amount)
+        if amt_i <= 0:
+            raise ValueError(f"{op_label} amount must be > 0, got {amt_i}")
+        if self.require_drawdown_stop:
+            acct = self.adapter.http.account(aid)
+            if not acct.get("ok"):
+                raise RuntimeError(f"GET /account preflight failed: {acct}")
+            min_dd = self._effective_min_drawdown_stop_micro()
+            cur_dd = int(acct.get("drawdown_stop_equity_micro", 0))
+            if cur_dd < min_dd:
+                raise PermissionError(
+                    f"drawdown_stop_required_before_trading: account {aid} has "
+                    f"drawdown_stop_equity_micro={cur_dd} (< minimum {min_dd}); "
+                    "call arena_configure_risk_guardrails first"
+                )
+        if self.max_order_notional_micro > 0:
+            aid_u16 = int(asset_id)
+            if aid_u16 == 0:
+                notional_micro = amt_i
+            else:
+                reloaded_t = False
+
+                def _cands_for_asset() -> List[int]:
+                    out_c: List[int] = []
+                    for pkinds in (("spot", "perp"), ("formula_perp",)):
+                        for mk, entry in self.adapter.markets_by_id.items():
+                            info = entry.get("info") if isinstance(entry, dict) else None
+                            if (
+                                isinstance(info, dict)
+                                and int(info.get("base_asset_id", 0)) == aid_u16
+                                and _canonical_market_kind(info.get("kind", "")) in pkinds
+                                and int(mk) not in out_c
+                            ):
+                                out_c.append(int(mk))
+                    return out_c
+
+                reload_exc: Optional[Exception] = None
+                if not self.adapter.markets_by_id:
+                    reloaded_t = True
+                    try:
+                        self.adapter.load_markets(reload=True)
+                    except Exception as exc:
+                        reload_exc = exc
+                cands = _cands_for_asset()
+                if not cands and not reloaded_t:
+                    try:
+                        self.adapter.load_markets(reload=True)
+                    except Exception as exc:
+                        reload_exc = exc
+                    cands = _cands_for_asset()
+                ref_px = 0
+                for mk_id in cands:
+                    ref_px = self._lookup_ref_ticks(mk_id, "bid")
+                    if ref_px > 0:
+                        break
+                if ref_px <= 0:
+                    detail = f" (market_reload_error={reload_exc})" if reload_exc is not None else ""
+                    raise PermissionError(
+                        f"max_order_notional_exceeded: unavailable reference price for asset_id={aid_u16} on {op_label}{detail}"
+                    )
+                notional_micro = amt_i * ref_px
+            if notional_micro > self.max_order_notional_micro:
+                raise PermissionError(
+                    f"max_order_notional_exceeded: {op_label} notional ${micro_to_usd_str(notional_micro)} "
+                    f"exceeds cap ${micro_to_usd_str(self.max_order_notional_micro)}"
+                )
+
+    def _scrub_obj(self, obj: Any) -> Any:
+        return _scrub_secrets(obj, text_scrubber=self._scrub_secret_text)
+
+    def _ok_tool_result(self, data: Any) -> Dict[str, Any]:
+        clean = self._scrub_obj(data)
+        return {
+            "content": [{"type": "text", "text": json.dumps(clean, indent=2)}],
+            "structuredContent": clean if isinstance(clean, dict) else {"result": clean},
+            "isError": False,
+        }
+
+    def _scrub_secret_text(self, message: str) -> str:
+        out = str(message)
+        raw_tokens: List[str] = []
+        for sec in (
+            getattr(self.adapter.http, "api_key", ""),
+            getattr(self.adapter.http, "api_secret", ""),
+            getattr(self, "_wallet_privkey_hex", "") or "",
+        ):
+            s = str(sec or "").strip()
+            if len(s) >= 6:
+                raw_tokens.append(s)
+                s_no_0x = s[2:] if s.lower().startswith("0x") else ""
+                if len(s_no_0x) >= 16:
+                    raw_tokens.append(s_no_0x)
+        rpc_cfg = str(getattr(self, "rpc_url", "") or "").strip()
+        if rpc_cfg:
+            parsed_rpc = urllib.parse.urlsplit(rpc_cfg)
+            if parsed_rpc.password and len(parsed_rpc.password) >= 6:
+                raw_tokens.append(parsed_rpc.password)
+            if parsed_rpc.query and len(parsed_rpc.query) >= 8:
+                raw_tokens.append(parsed_rpc.query)
+            last_seg = parsed_rpc.path.rstrip("/").rsplit("/", 1)[-1] if parsed_rpc.path else ""
+            if len(last_seg) >= 16 and last_seg.lower() not in ("rpc", "jsonrpc"):
+                raw_tokens.append(last_seg)
+        wire_ints: List[int] = [
+            int(getattr(self.adapter, "_wire_key_lo64", 0) or 0) & MASK64,
+            int(getattr(self.adapter, "_wire_key_hi64", 0) or 0) & MASK64,
+        ]
+        bin_obj = getattr(self.adapter, "binary", None)
+        if bin_obj is not None:
+            wire_ints.extend(
+                [
+                    int(getattr(bin_obj, "key_lo64", 0) or 0) & MASK64,
+                    int(getattr(bin_obj, "key_hi64", 0) or 0) & MASK64,
+                ]
+            )
+        for wk in wire_ints:
+            if wk > 0:
+                wk_dec = str(wk)
+                if len(wk_dec) >= 6:
+                    raw_tokens.append(wk_dec)
+                raw_tokens.extend(
+                    [
+                        f"0x{wk:016x}",
+                        f"0X{wk:016X}",
+                        f"{wk:016x}",
+                        f"{wk:016X}",
+                    ]
+                )
+                wk_hex_short = f"{wk:x}"
+                if len(wk_hex_short) >= 6:
+                    raw_tokens.append(f"0x{wk_hex_short}")
+        for tok in raw_tokens:
+            if tok:
+                out = out.replace(tok, "[REDACTED]")
+        return _SECRET_KV_RE.sub(r"\1[REDACTED]", out)
+
+    def _err_tool_result(self, message: str) -> Dict[str, Any]:
+        return {
+            "content": [{"type": "text", "text": self._scrub_secret_text(str(message))}],
+            "isError": True,
+        }
+
+    def list_tools(self) -> List[Dict[str, Any]]:
+        specs = _tool_specs()
+        if self.read_only:
+            return [t for t in specs if t["name"] in READ_ONLY_TOOLS]
+        return specs
+
+    def list_resources(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "uri": "arena://protocol/manifest",
+                "name": "Arena Exchange Protocol Manifest",
+                "mimeType": "application/json",
+            },
+            {
+                "uri": "arena://markets/directory",
+                "name": "Arena Exchange Live Market Directory",
+                "mimeType": "application/json",
+            },
+            {
+                "uri": "arena://ledger/tip",
+                "name": "Verified Sovereign WAL Ledger Tip",
+                "mimeType": "application/json",
+            },
+        ]
+
+    def read_resource(self, uri: str) -> Dict[str, Any]:
+        if uri == "arena://protocol/manifest":
+            payload = self.adapter.http.protocol_info()
+        elif uri == "arena://markets/directory":
+            payload = self.adapter.http.markets()
+        elif uri == "arena://ledger/tip":
+            payload = self._verify_ledger_tip_impl(self.expected_operator_address)
+        else:
+            raise ValueError(f"Unknown resource URI: {uri!r}")
+        clean = self._scrub_obj(payload)
+        return {
+            "contents": [
+                {
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": json.dumps(clean, indent=2),
+                }
+            ]
+        }
+
+    def _verify_ledger_tip_impl(self, exp_op_addr: str) -> Dict[str, Any]:
+        tip = self.adapter.http.ledger_tip()
+        if not tip.get("ok"):
+            raise RuntimeError(f"GET /ledger/tip failed: {tip}")
+        pinned = str(exp_op_addr or "").strip()
+        verified = verify_ledger_tip(
+            tip,
+            expected_operator_address=pinned,
+            allow_self_asserted_signer=(not bool(pinned)),
+        )
+        out = dict(tip)
+        out["signature_verified"] = bool(verified)
+        out["pinned_operator_checked"] = bool(pinned)
+        return out
+
+    def call_tool(self, name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        args = dict(arguments or {})
+        all_names = {t["name"] for t in _tool_specs()}
+        if name not in all_names:
+            raise KeyError(f"Unknown tool: {name!r}")
+        if self.read_only and name not in READ_ONLY_TOOLS:
+            return self._err_tool_result(f"read_only_mode_enabled: mutating tool {name!r} rejected")
+
+        try:
+            if name == "arena_health_and_manifest":
+                health = self.adapter.http.health()
+                out: Dict[str, Any] = {"health": health}
+                if bool(args.get("include_manifest", True)):
+                    out["manifest"] = self.adapter.http.protocol_info()
+                return self._ok_tool_result(out)
+
+            if name == "arena_list_markets":
+                resp = self.adapter.http.markets()
+                if not resp.get("ok"):
+                    raise RuntimeError(f"GET /markets failed: {resp}")
+                mkts = list(resp.get("markets", []))
+                kind_f = _canonical_market_kind(args.get("kind", ""))
+                sym_f = str(args.get("symbol", "")).strip().upper()
+                active_only = bool(args.get("active_only", True))
+                filtered: List[Dict[str, Any]] = []
+                for m in mkts:
+                    if kind_f and _canonical_market_kind(m.get("kind", "")) != kind_f:
+                        continue
+                    if active_only and str(m.get("trading_status", "live")).lower() == "halted":
+                        continue
+                    unified = self.adapter._unified_symbol_for_market(m)
+                    if sym_f and sym_f not in (str(m.get("symbol", "")).upper(), unified.upper()):
+                        continue
+                    item = dict(m)
+                    item["unified_symbol"] = unified
+                    item["mark_price_usd"] = price_ticks_to_usd_str(int(m.get("mark_price_ticks", 0)))
+                    item["best_bid_usd"] = price_ticks_to_usd_str(int(m.get("best_bid_ticks", 0)))
+                    item["best_ask_usd"] = price_ticks_to_usd_str(int(m.get("best_ask_ticks", 0)))
+                    filtered.append(item)
+                return self._ok_tool_result({"wal_seq": resp.get("wal_seq", 0), "count": len(filtered), "markets": filtered})
+
+            if name == "arena_get_orderbook":
+                m = self._resolve_market_args(args)
+                depth = int(args.get("depth", 20))
+                book = self.adapter.http.book(int(m["market_id"]), depth=depth)
+                if not book.get("ok"):
+                    raise RuntimeError(f"GET /book failed: {book}")
+                book["unified_symbol"] = self.adapter._unified_symbol_for_market(m)
+                return self._ok_tool_result(book)
+
+            if name == "arena_get_trades_and_candles":
+                m = self._resolve_market_args(args)
+                mid = int(m["market_id"])
+                interval = str(args.get("interval", "1m"))
+                limit = int(args.get("limit", 50))
+                trades = self.adapter.http.trades(mid, limit=min(512, limit))
+                candles = self.adapter.http.candles(mid, interval=interval, limit=min(240, limit))
+                return self._ok_tool_result(
+                    {
+                        "market_id": mid,
+                        "symbol": m.get("symbol"),
+                        "unified_symbol": self.adapter._unified_symbol_for_market(m),
+                        "trades": trades.get("trades", []),
+                        "candles": candles.get("candles", []),
+                    }
+                )
+
+            if name == "arena_get_leaderboard":
+                limit = int(args.get("limit", 25))
+                sort_by = str(args.get("sort", "equity")).strip().lower() or "equity"
+                lb = self.adapter.http.get_leaderboard(limit=limit, sort=sort_by)
+                if not lb.get("ok"):
+                    raise RuntimeError(f"GET /leaderboard failed: {lb}")
+                return self._ok_tool_result(lb)
+
+            if name == "arena_get_account_portfolio":
+                aid = self._effective_account(args.get("account_id"))
+                acct = self.adapter.http.account(aid)
+                if not acct.get("ok"):
+                    raise RuntimeError(f"GET /account failed: {acct}")
+                acct["total_equity_usd"] = micro_to_usd_str(int(acct.get("total_equity_micro", 0)))
+                acct["free_usd"] = micro_to_usd_str(int(acct.get("free_usd_micro", 0)))
+                acct["withdrawable_usd"] = micro_to_usd_str(int(acct.get("withdrawable_usd_micro", 0)))
+                return self._ok_tool_result(acct)
+
+            if name == "arena_verify_ledger_tip":
+                exp = str(args.get("expected_operator_address") or self.expected_operator_address or "").strip()
+                res = self._verify_ledger_tip_impl(exp)
+                if not res.get("signature_verified"):
+                    return self._err_tool_result(f"ledger_tip_signature_verification_failed: {json.dumps(self._scrub_obj(res))}")
+                return self._ok_tool_result(res)
+
+            if name == "arena_get_withdrawals_and_escape_proof":
+                aid = self._effective_account(args.get("account_id"))
+                limit = int(args.get("limit", 50))
+                wres = self.adapter.http.withdrawals(account_id=aid, limit=limit)
+                if not wres.get("ok"):
+                    raise RuntimeError(f"GET /withdrawals failed: {wres}")
+                out: Dict[str, Any] = {"account_id": aid, "withdrawals": wres.get("withdrawals", []), "total_count": wres.get("total_count", 0)}
+                asset_id = int(args.get("asset_id", 0))
+                if bool(args.get("include_escape_proof", False)):
+                    ep = self.adapter.http.settlement_escape_proof(
+                        aid, asset_id=asset_id, pending=bool(args.get("pending", False))
+                    )
+                    if not ep.get("ok"):
+                        raise RuntimeError(f"GET /settlement/escape_proof failed: {ep}")
+                    exp_root = str(args.get("expected_escape_merkle_root") or "").strip()
+                    ep["merkle_proof_verified"] = verify_escape_merkle_proof(
+                        ep,
+                        expected_escape_merkle_root=exp_root,
+                        allow_self_asserted_root=(not bool(exp_root)),
+                    )
+                    out["escape_proof"] = ep
+                if bool(args.get("verify_from_onchain_logs", False)):
+                    if not (self.rpc_url and self.clearinghouse):
+                        raise ValueError("verify_from_onchain_logs requires --rpc-url and --clearinghouse")
+                    evm = EvmJsonRpcClient(self.rpc_url, timeout=self.adapter.timeout)
+                    try:
+                        bal_u, owner_w, proof_list = reconstruct_escape_merkle_proof_from_logs(
+                            evm, self.clearinghouse, aid, asset_id=asset_id
+                        )
+                    finally:
+                        evm.close()
+                    out["onchain_log_escape"] = {
+                        "merkle_balance_units": bal_u,
+                        "owner_wallet": owner_w,
+                        "merkle_proof": proof_list,
+                    }
+                return self._ok_tool_result(out)
+
+            if name == "arena_login_wallet":
+                if self._static_creds_configured and not self.allow_wallet_login:
+                    raise PermissionError(
+                        "wallet_login_disabled: static --creds-file / --api-key credentials are configured; "
+                        "pass --allow-wallet-login to permit arena_login_wallet session replacement"
+                    )
+                gen = bool(args.get("generate_ephemeral", False))
+                if self._wallet_privkey_hex and not gen:
+                    signer = EthWalletSigner(self._wallet_privkey_hex)
+                elif gen:
+                    signer = EthWalletSigner()
+                else:
+                    raise ValueError("No --wallet-privkey configured; pass generate_ephemeral=true or configure wallet CLI flag")
+                http_c = self.adapter.http
+                prev_key = http_c.api_key
+                prev_sec = http_c.api_secret
+                prev_creds_path = getattr(http_c, "_creds_path", None)
+                prev_creds_role = getattr(http_c, "_creds_role", "trader")
+                prev_creds_fb = getattr(http_c, "_creds_fallback_role", None)
+                prev_creds_mtime = getattr(http_c, "_creds_mtime_ns", None)
+
+                def _restore_http_creds() -> None:
+                    http_c.set_credentials(prev_key, prev_sec)
+                    if hasattr(http_c, "_creds_path"):
+                        http_c._creds_path = prev_creds_path
+                        http_c._creds_role = prev_creds_role
+                        http_c._creds_fallback_role = prev_creds_fb
+                        http_c._creds_mtime_ns = prev_creds_mtime
+
+                try:
+                    res = http_c.login_with_wallet(signer)
+                    if not res.get("ok"):
+                        raise RuntimeError(f"Wallet login failed: {self._scrub_obj(res)}")
+                    aid = int(res["account_id"])
+                    self._check_account_allowlist(aid)
+                except Exception:
+                    _restore_http_creds()
+                    raise
+                self._wallet_privkey_hex = signer.private_key_hex
+                self.adapter.account_id = aid
+                self.adapter._wire_key_lo64 = int(res.get("wire_key_lo64", self.adapter._wire_key_lo64)) & MASK64
+                self.adapter._wire_key_hi64 = int(res.get("wire_key_hi64", self.adapter._wire_key_hi64)) & MASK64
+                if self.adapter.binary is not None:
+                    self.adapter.binary.close()
+                    self.adapter._tcp_connected = False
+                    self.adapter.binary.set_credentials(aid, self.adapter._wire_key_lo64, self.adapter._wire_key_hi64)
+                return self._ok_tool_result(
+                    {
+                        "ok": True,
+                        "account_id": aid,
+                        "eth_address": res.get("eth_address", signer.address),
+                        "role": res.get("role", "trader"),
+                    }
+                )
+
+            if name == "arena_configure_risk_guardrails":
+                aid = self._effective_account(args.get("account_id"))
+                if args.get("cancel_on_disconnect") is not None and not self._has_binary_wire():
+                    raise ValueError(
+                        "cancel_on_disconnect requires binary wire (--tcp-port > 0)"
+                    )
+                results: Dict[str, Any] = {"account_id": aid}
+                if args.get("drawdown_stop_usd_micro") is not None or args.get("drawdown_stop_usd") is not None:
+                    dd_micro = (
+                        int(args["drawdown_stop_usd_micro"])
+                        if args.get("drawdown_stop_usd_micro") is not None
+                        else usd_to_micro(args["drawdown_stop_usd"], allow_zero=True)
+                    )
+                    if dd_micro < 0:
+                        raise ValueError(f"drawdown_stop_usd_micro must be >= 0, got {dd_micro}")
+                    if self.require_drawdown_stop:
+                        min_dd = self._effective_min_drawdown_stop_micro()
+                        if dd_micro <= 0:
+                            raise PermissionError(
+                                "drawdown_stop_cannot_be_disabled: drawdown stop cannot be disabled while "
+                                "--require-drawdown-stop / --min-drawdown-stop-usd is enabled"
+                            )
+                        if dd_micro < min_dd:
+                            raise PermissionError(
+                                f"drawdown_stop_below_minimum: requested drawdown_stop_equity_micro={dd_micro} "
+                                f"is below minimum required {min_dd}"
+                            )
+                        cur_acct = self.adapter.http.account(aid)
+                        if not cur_acct.get("ok"):
+                            raise RuntimeError(f"GET /account failed before drawdown stop update: {cur_acct}")
+                        cur_dd = int(cur_acct.get("drawdown_stop_equity_micro", 0))
+                        if cur_dd > 0 and dd_micro < cur_dd:
+                            raise PermissionError(
+                                f"drawdown_stop_cannot_be_lowered: requested drawdown_stop_equity_micro={dd_micro} "
+                                f"would lower active floor {cur_dd} while --require-drawdown-stop is enabled"
+                            )
+                    r = self.adapter.http.set_drawdown_stop(aid, dd_micro)
+                    if not r.get("ok"):
+                        raise RuntimeError(f"POST /drawdown_stop failed: {r}")
+                    results["drawdown_stop"] = r
+                if (
+                    args.get("knockout_price_ticks") is not None
+                    or args.get("knockout_price_usd") is not None
+                ):
+                    if args.get("knockout_symbol"):
+                        ko_mkt = self.adapter.resolve_market(str(args["knockout_symbol"]))
+                    elif args.get("knockout_market_id") is not None:
+                        ko_mkt = self.adapter.resolve_market(int(args["knockout_market_id"]))
+                    else:
+                        raise ValueError("knockout requires knockout_symbol or knockout_market_id")
+                    ko_ticks = (
+                        int(args["knockout_price_ticks"])
+                        if args.get("knockout_price_ticks") is not None
+                        else usd_to_price_ticks(args["knockout_price_usd"], allow_zero=True)
+                    )
+                    r = self.adapter.http.set_knockout(aid, int(ko_mkt["market_id"]), ko_ticks)
+                    if not r.get("ok"):
+                        raise RuntimeError(f"POST /knockout failed: {r}")
+                    results["knockout"] = r
+                if any(
+                    args.get(k) is not None
+                    for k in ("mmp_window_wal_seqs", "mmp_max_fill_lots", "mmp_max_delta_lots", "mmp_cooldown_wal_seqs")
+                ):
+                    r = self.adapter.http.configure_mmp(
+                        account_id=aid,
+                        window_wal_seqs=int(args.get("mmp_window_wal_seqs", 0)),
+                        max_fill_lots=int(args.get("mmp_max_fill_lots", 0)),
+                        max_delta_lots=int(args.get("mmp_max_delta_lots", 0)),
+                        cooldown_wal_seqs=int(args.get("mmp_cooldown_wal_seqs", 0)),
+                    )
+                    if not r.get("ok"):
+                        raise RuntimeError(f"POST /account/mmp failed: {r}")
+                    results["mmp"] = r
+                if args.get("cancel_on_disconnect") is not None:
+                    bin_cli = self.adapter._ensure_binary(account_id=aid)
+                    wres = bin_cli.set_cancel_on_disconnect(
+                        market_id=int(args.get("cod_market_id", 0)),
+                        enable=bool(args["cancel_on_disconnect"]),
+                        timeout_ms=int(args.get("cod_timeout_ms", 0)),
+                    )
+                    if wres.status_code != WireStatusCode.OK:
+                        raise RuntimeError(f"Wire SetCancelOnDisconnect rejected ({wres.status_code.name})")
+                    results["cancel_on_disconnect"] = {"ok": True, "wal_seq": int(wres.wal_seq)}
+                if len(results) == 1:
+                    raise ValueError("No guardrail settings specified")
+                return self._ok_tool_result(results)
+
+            if name == "arena_manage_prime_subaccount":
+                act = str(args["action"]).strip().lower()
+                if act in ("link", "unlink"):
+                    master = self._effective_account(args.get("master_account_id"))
+                    if args.get("sub_account_id") is None:
+                        raise ValueError("sub_account_id required for link/unlink")
+                    sub_id = int(args["sub_account_id"])
+                    self._check_account_allowlist(sub_id)
+                    if act == "unlink":
+                        g_micro = -2
+                    else:
+                        if args.get("max_guaranty_usd_micro") is not None:
+                            g_micro = int(args["max_guaranty_usd_micro"])
+                        elif args.get("max_guaranty_usd") is not None:
+                            g_micro = usd_to_micro(args["max_guaranty_usd"], allow_zero=True)
+                        else:
+                            g_micro = 0
+                        if g_micro < 0:
+                            raise ValueError(f"max_guaranty_usd_micro must be >= 0, got {g_micro}")
+                        if self.max_order_notional_micro > 0:
+                            if g_micro == 0:
+                                raise PermissionError(
+                                    "max_order_notional_exceeded: unlimited max_guaranty_usd_micro=0 is disallowed when --max-order-notional-usd is enabled"
+                                )
+                            if g_micro > self.max_order_notional_micro:
+                                raise PermissionError(
+                                    f"max_order_notional_exceeded: prime guaranty ${micro_to_usd_str(g_micro)} "
+                                    f"exceeds cap ${micro_to_usd_str(self.max_order_notional_micro)}"
+                                )
+                        self._preflight_risk_and_builder(master, risk_increasing=True)
+                    res = self.adapter.http.link_sub_account(master, sub_id, max_guaranty_usd_micro=g_micro)
+                    if not res.get("ok"):
+                        raise RuntimeError(f"POST /prime/link_sub failed: {res}")
+                    return self._ok_tool_result(res)
+                if act == "transfer":
+                    from_aid = self._effective_account(args.get("from_account_id"))
+                    if args.get("to_account_id") is None:
+                        raise ValueError("to_account_id required for transfer")
+                    to_aid = int(args["to_account_id"])
+                    self._check_account_allowlist(to_aid)
+                    asset_id = int(args.get("asset_id", 0))
+                    if args.get("amount") is not None:
+                        amt_raw = int(args["amount"])
+                    elif asset_id == 0 and args.get("amount_usd") is not None:
+                        amt_raw = usd_to_micro(args["amount_usd"])
+                    elif asset_id > 0 and args.get("amount_base") is not None:
+                        amt_raw = base_to_qty_lots(args["amount_base"])
+                    else:
+                        raise ValueError("Specify amount, amount_usd (asset_id=0), or amount_base (asset_id>0)")
+                    self._enforce_transfer_or_withdrawal_guardrails(
+                        aid=from_aid, asset_id=asset_id, raw_amount=amt_raw, op_label="prime_internal_transfer"
+                    )
+                    res = self.adapter.http.prime_internal_transfer(from_aid, to_aid, amt_raw, asset_id=asset_id)
+                    if not res.get("ok"):
+                        raise RuntimeError(f"POST /prime/transfer failed: {res}")
+                    return self._ok_tool_result(res)
+                raise ValueError(f"Unknown action: {act!r}")
+
+            if name == "arena_bind_builder":
+                aid = self._effective_account(args.get("trader_account_id"))
+                b_aid = int(args["builder_account_id"])
+                bps = int(args["builder_fee_share_bps"])
+                if self.default_builder_account > 0 and (
+                    b_aid != self.default_builder_account or bps != self.default_builder_bps
+                ):
+                    raise PermissionError(
+                        "builder_binding_locked: --default-builder-account is enforced by operator policy"
+                    )
+                res = self.adapter.http.bind_builder_code(aid, b_aid, bps)
+                if not res.get("ok"):
+                    raise RuntimeError(f"POST /account/builder failed: {res}")
+                if b_aid > 0 and bps > 0:
+                    self._builder_bound_accounts.add(aid)
+                return self._ok_tool_result(res)
+
+            if name == "arena_place_order":
+                aid = self._effective_account(args.get("account_id"))
+                m = self._resolve_market_args(args)
+                mid = int(m["market_id"])
+                side_raw = str(args["side"]).strip().lower()
+                is_market = bool(args.get("is_market", False))
+                reduce_only = bool(args.get("reduce_only", False))
+                is_pegged = any(
+                    bool(args.get(f, False))
+                    for f in ("primary_peg", "midpoint_peg", "mark_peg", "trailing_peg", "dark_midpoint")
+                )
+                is_spread = str(m.get("kind", "")).lower() == "spread_book"
+                px_ticks = self._resolve_price_ticks(
+                    args, m, allow_zero=(is_market or is_pegged or is_spread)
+                )
+                qty_lots = self._resolve_qty_lots(args)
+                margin_spot_flag = bool(args.get("margin_spot", False))
+                disp_lots = int(args.get("display_qty_lots", 0))
+                dark_flag = bool(args.get("dark_midpoint", False))
+                jit_mult = int(args.get("jit_elastic_mult", 0))
+                peg_off = int(args.get("peg_offset_ticks", 0))
+                self._enforce_notional_cap(
+                    market=m,
+                    side_str=side_raw,
+                    price_ticks=px_ticks,
+                    qty_lots=qty_lots,
+                    reduce_only=reduce_only,
+                    is_pegged_or_market=(is_market or is_pegged),
+                    jit_elastic_mult=jit_mult,
+                    margin_spot=margin_spot_flag,
+                    is_visible_iceberg=(disp_lots > 0 and not dark_flag),
+                    peg_offset_ticks=peg_off,
+                )
+                self._preflight_risk_and_builder(aid, risk_increasing=(not reduce_only))
+
+                use_bin = bool(args.get("use_binary_wire", False)) and self._has_binary_wire()
+                params: Dict[str, Any] = {
+                    "account_id": aid,
+                    "price_ticks": px_ticks,
+                    "tif": str(args.get("tif", "ioc" if is_market else "gtc")),
+                    "stp": str(args.get("stp", "cancel_resting")),
+                    "reduce_only": reduce_only,
+                    "margin_spot": margin_spot_flag,
+                    "post_only_slide": bool(args.get("post_only_slide", False)),
+                    "primary_peg": bool(args.get("primary_peg", False)),
+                    "midpoint_peg": bool(args.get("midpoint_peg", False)),
+                    "mark_peg": bool(args.get("mark_peg", False)),
+                    "trailing_peg": bool(args.get("trailing_peg", False)),
+                    "dark_midpoint": dark_flag,
+                    "oco_linked": bool(args.get("oco_linked", False)),
+                    "stp_decrement_and_cancel": bool(args.get("stp_decrement_and_cancel", False)),
+                    "client_tag": int(args.get("client_tag", 0)),
+                    "min_qty_lots": int(args.get("min_qty_lots", 0)),
+                    "display_qty_lots": disp_lots,
+                    "auto_skew_ticks": int(args.get("auto_skew_ticks", 0)),
+                    "auto_flip_ticks": int(args.get("auto_flip_ticks", 0)),
+                    "peg_offset_ticks": int(args.get("peg_offset_ticks", 0)),
+                    "max_lifetime_wal_seqs": int(args.get("max_lifetime_wal_seqs", 0)),
+                    "jit_elastic_mult": jit_mult,
+                    "priority_fee_ppm": int(args.get("priority_fee_ppm", 0)),
+                    "use_binary_wire": use_bin,
+                }
+                res = self.adapter.create_order(
+                    mid,
+                    "market" if is_market else "limit",
+                    side_raw,
+                    qty_lots_to_base_str(qty_lots),
+                    None,
+                    params=params,
+                )
+                return self._ok_tool_result(res)
+
+            if name == "arena_replace_two_sided_quote":
+                aid = self._effective_account(args.get("account_id"))
+                m = self._resolve_market_args(args)
+                mid = int(m["market_id"])
+                q_peg_mode = int(args.get("quote_peg_mode", 0))
+                is_spread = str(m.get("kind", "")).lower() == "spread_book"
+                bid_ticks = self._resolve_price_ticks(
+                    args, m, usd_key="bid_price_usd", ticks_key="bid_price_ticks", allow_zero=(q_peg_mode > 0 or is_spread)
+                )
+                ask_ticks = self._resolve_price_ticks(
+                    args, m, usd_key="ask_price_usd", ticks_key="ask_price_ticks", allow_zero=(q_peg_mode > 0 or is_spread)
+                )
+                bid_lots = self._resolve_qty_lots(args, base_key="bid_amount_base", lots_key="bid_qty_lots", allow_zero=True)
+                ask_lots = self._resolve_qty_lots(args, base_key="ask_amount_base", lots_key="ask_qty_lots", allow_zero=True)
+                q_margin_spot = bool(args.get("margin_spot", False))
+                q_jit_mult = int(args.get("jit_elastic_mult", 0))
+                q_peg_off = int(args.get("peg_offset_ticks", 0))
+                bid_not = self._enforce_notional_cap(
+                    market=m,
+                    side_str="bid",
+                    price_ticks=bid_ticks,
+                    qty_lots=bid_lots,
+                    reduce_only=False,
+                    is_pegged_or_market=(q_peg_mode > 0),
+                    jit_elastic_mult=q_jit_mult,
+                    margin_spot=q_margin_spot,
+                    is_visible_iceberg=False,
+                    peg_offset_ticks=q_peg_off,
+                )
+                ask_not = self._enforce_notional_cap(
+                    market=m,
+                    side_str="ask",
+                    price_ticks=ask_ticks,
+                    qty_lots=ask_lots,
+                    reduce_only=False,
+                    is_pegged_or_market=(q_peg_mode > 0),
+                    jit_elastic_mult=q_jit_mult,
+                    margin_spot=q_margin_spot,
+                    is_visible_iceberg=False,
+                    peg_offset_ticks=q_peg_off,
+                )
+                if self.max_order_notional_micro > 0 and (bid_not + ask_not) > self.max_order_notional_micro:
+                    raise PermissionError(
+                        f"max_order_notional_exceeded: combined quote notional "
+                        f"${micro_to_usd_str(bid_not + ask_not)} exceeds cap "
+                        f"${micro_to_usd_str(self.max_order_notional_micro)}"
+                    )
+                self._preflight_risk_and_builder(aid, risk_increasing=True)
+                use_bin = bool(args.get("use_binary_wire", False)) and self._has_binary_wire()
+                tif_s = str(args.get("tif", "gtc")).strip().lower()
+                stp_s = str(args.get("stp", "cancel_resting")).strip().lower()
+                if use_bin:
+                    bin_cli = self.adapter._ensure_binary(account_id=aid)
+                    tif_map_q = {
+                        "gtc": TimeInForce.GTC,
+                        "post_only": TimeInForce.POST_ONLY,
+                        "postonly": TimeInForce.POST_ONLY,
+                        "ioc": TimeInForce.IOC,
+                        "fok": TimeInForce.FOK,
+                    }
+                    if tif_s not in tif_map_q:
+                        raise ValueError(f"Unsupported tif {tif_s!r}")
+                    tif_val = tif_map_q[tif_s]
+                    stp_map = {
+                        "cancel_resting": StpMode.CANCEL_RESTING,
+                        "cancel_incoming": StpMode.CANCEL_INCOMING,
+                        "cancel_aggressor": StpMode.CANCEL_INCOMING,
+                        "cancel_both": StpMode.CANCEL_BOTH,
+                        "none": StpMode.NONE,
+                    }
+                    if stp_s not in stp_map:
+                        raise ValueError(f"Unsupported stp {stp_s!r}")
+                    wres = bin_cli.quote_replace(
+                        market_id=mid,
+                        bid_price_ticks=bid_ticks,
+                        bid_qty_lots=bid_lots,
+                        ask_price_ticks=ask_ticks,
+                        ask_qty_lots=ask_lots,
+                        tif=tif_val,
+                        stp=stp_map[stp_s],
+                        post_only_slide=bool(args.get("post_only_slide", False)),
+                        margin_spot=bool(args.get("margin_spot", False)),
+                        auto_skew_ticks=int(args.get("auto_skew_ticks", 0)),
+                        oco_linked=bool(args.get("oco_linked", False)),
+                        max_lifetime_wal_seqs=int(args.get("max_lifetime_wal_seqs", 0)),
+                        jit_elastic_mult=int(args.get("jit_elastic_mult", 0)),
+                        auto_flip_ticks=int(args.get("auto_flip_ticks", 0)),
+                        quote_peg_mode=q_peg_mode,
+                        peg_offset_ticks=int(args.get("peg_offset_ticks", 0)),
+                        client_tag=int(args.get("client_tag", 0)),
+                        ladder_by_tag=bool(args.get("ladder_by_tag", False)),
+                        account_id=aid,
+                    )
+                    if wres.status_code != WireStatusCode.OK:
+                        raise RuntimeError(f"Wire quote_replace rejected ({wres.status_code.name})")
+                    return self._ok_tool_result(
+                        {
+                            "ok": True,
+                            "status": wres.status_code.name,
+                            "order_status": wres.order_status.name,
+                            "wal_seq": int(wres.wal_seq),
+                            "order_id": int(wres.order_id),
+                            "filled_lots": int(wres.filled_lots),
+                            "resting_lots": int(wres.resting_lots),
+                        }
+                    )
+                res = self.adapter.http.quote_replace(
+                    account_id=aid,
+                    market_id=mid,
+                    bid_price_ticks=bid_ticks,
+                    bid_qty_lots=bid_lots,
+                    ask_price_ticks=ask_ticks,
+                    ask_qty_lots=ask_lots,
+                    tif=tif_s,
+                    stp=stp_s,
+                    post_only_slide=bool(args.get("post_only_slide", False)),
+                    margin_spot=bool(args.get("margin_spot", False)),
+                    client_tag=int(args.get("client_tag", 0)),
+                    auto_skew_ticks=int(args.get("auto_skew_ticks", 0)),
+                    oco_linked=bool(args.get("oco_linked", False)),
+                    max_lifetime_wal_seqs=int(args.get("max_lifetime_wal_seqs", 0)),
+                    jit_elastic_mult=int(args.get("jit_elastic_mult", 0)),
+                    auto_flip_ticks=int(args.get("auto_flip_ticks", 0)),
+                    quote_peg_mode=q_peg_mode,
+                    peg_offset_ticks=int(args.get("peg_offset_ticks", 0)),
+                    ladder_by_tag=bool(args.get("ladder_by_tag", False)),
+                )
+                if not res.get("ok"):
+                    raise RuntimeError(f"POST /quote rejected: {res}")
+                return self._ok_tool_result(res)
+
+            if name == "arena_modify_order":
+                aid = self._effective_account(args.get("account_id"))
+                m = self._resolve_market_args(args)
+                mid = int(m["market_id"])
+                oid = int(args["order_id"])
+                new_ticks = self._resolve_price_ticks(args, m)
+                new_lots = self._resolve_qty_lots(args)
+                acct_snap = self.adapter.http.account(aid)
+                if not isinstance(acct_snap, dict) or not acct_snap.get("ok"):
+                    raise RuntimeError(f"GET /account failed: {acct_snap}")
+                old_order = None
+                for oo in list((acct_snap or {}).get("open_orders", [])):
+                    if int(oo.get("order_id", 0)) == oid and int(oo.get("market_id", 0)) == mid:
+                        old_order = oo
+                        break
+                if old_order is None:
+                    raise ValueError(f"open order {oid} on market {mid} not found on account {aid}")
+                orig_side_raw = str(old_order.get("side", "")).strip().lower()
+                if orig_side_raw not in ("bid", "buy", "ask", "sell"):
+                    raise ValueError(f"Invalid side {orig_side_raw!r} on open order {oid}")
+                orig_side_wire = "ask" if orig_side_raw in ("ask", "sell") else "bid"
+                orig_side_ccxt = "sell" if orig_side_wire == "ask" else "buy"
+                is_reduce = bool(old_order.get("reduce_only", False))
+                old_jit_mult = int(old_order.get("jit_elastic_mult", 0))
+                if "dark_hidden" in old_order and "display_qty_lots" in old_order:
+                    old_vis_iceberg = (not bool(old_order.get("dark_hidden", False))) and (
+                        int(old_order.get("display_qty_lots", 0)) > 0
+                    )
+                else:
+                    old_vis_iceberg = False
+                old_is_pegged = (int(old_order.get("peg_mode", 0)) > 0) or bool(old_order.get("dark_hidden", False))
+                self._enforce_notional_cap(
+                    market=m,
+                    side_str=orig_side_wire,
+                    price_ticks=new_ticks,
+                    qty_lots=new_lots,
+                    reduce_only=is_reduce,
+                    is_pegged_or_market=old_is_pegged,
+                    jit_elastic_mult=old_jit_mult,
+                    margin_spot=False,
+                    is_visible_iceberg=old_vis_iceberg,
+                    peg_offset_ticks=int(old_order.get("peg_offset_ticks", 0)),
+                )
+                self._preflight_risk_and_builder(aid, risk_increasing=(not is_reduce))
+                res = self.adapter.edit_order(
+                    oid,
+                    mid,
+                    "limit",
+                    orig_side_ccxt,
+                    qty_lots_to_base_str(new_lots),
+                    price_ticks_to_usd_str(new_ticks),
+                    params={
+                        "account_id": aid,
+                        "keep_priority": bool(args.get("keep_priority", False)),
+                        "use_binary_wire": bool(args.get("use_binary_wire", False)) and self._has_binary_wire(),
+                    },
+                )
+                return self._ok_tool_result(res)
+
+            if name == "arena_cancel_orders":
+                aid = self._effective_account(args.get("account_id"))
+                oid = int(args.get("order_id", 0))
+                do_all = bool(args.get("cancel_all", False)) or oid <= 0
+                use_bin = bool(args.get("use_binary_wire", False)) and self._has_binary_wire()
+                mid = int(self._resolve_market_args(args)["market_id"]) if (args.get("symbol") or args.get("market_id", 0) > 0) else 0
+                if do_all:
+                    res = self.adapter.cancel_all_orders(
+                        mid if mid > 0 else None,
+                        params={
+                            "account_id": aid,
+                            "client_tag_filter": int(args.get("client_tag_filter", 0)),
+                            "market_bitmask": int(args.get("market_bitmask", 0)),
+                            "side": str(args.get("side", "")),
+                            "use_binary_wire": use_bin,
+                        },
+                    )
+                else:
+                    if mid <= 0:
+                        raise ValueError("market_id or symbol required when cancelling a single order_id")
+                    res = self.adapter.cancel_order(
+                        oid, mid, params={"account_id": aid, "use_binary_wire": use_bin}
+                    )
+                return self._ok_tool_result(res)
+
+            if name == "arena_execute_atomic_basket":
+                aid = self._effective_account(args.get("account_id"))
+                raw_legs = list(args["legs"])
+                resolved_legs: List[Dict[str, Any]] = []
+                any_risk_inc = False
+                total_notional_micro = 0
+                for lg in raw_legs:
+                    m = self._resolve_market_args(lg)
+                    is_mkt = bool(lg.get("is_market", False))
+                    red_only = bool(lg.get("reduce_only", False))
+                    is_spread = str(m.get("kind", "")).lower() == "spread_book"
+                    px_t = self._resolve_price_ticks(lg, m, allow_zero=(is_mkt or is_spread))
+                    qty_l = self._resolve_qty_lots(lg)
+                    side_raw = str(lg["side"]).strip().lower()
+                    side_s = "bid" if side_raw in ("buy", "bid") else "ask"
+                    if not red_only:
+                        any_risk_inc = True
+                    total_notional_micro += self._enforce_notional_cap(
+                        market=m,
+                        side_str=side_s,
+                        price_ticks=px_t,
+                        qty_lots=qty_l,
+                        reduce_only=red_only,
+                        is_pegged_or_market=is_mkt,
+                    )
+                    resolved_legs.append(
+                        {
+                            "market_id": int(m["market_id"]),
+                            "side": side_s,
+                            "price_ticks": px_t,
+                            "qty_lots": qty_l,
+                            "is_market": is_mkt,
+                            "reduce_only": red_only,
+                            "margin_spot": bool(lg.get("margin_spot", False)),
+                        }
+                    )
+                if self.max_order_notional_micro > 0 and total_notional_micro > self.max_order_notional_micro:
+                    raise PermissionError(
+                        f"max_order_notional_exceeded: atomic basket notional "
+                        f"${micro_to_usd_str(total_notional_micro)} exceeds cap "
+                        f"${micro_to_usd_str(self.max_order_notional_micro)}"
+                    )
+                exp_bid_bps = int(args.get("express_surplus_bid_bps", 0))
+                if not (0 <= exp_bid_bps <= 5000):
+                    raise ValueError(f"express_surplus_bid_bps {exp_bid_bps} out of [0, 5000]")
+                self._preflight_risk_and_builder(aid, risk_increasing=any_risk_inc)
+                res = self.adapter.http.execute_basket(
+                    account_id=aid,
+                    legs=resolved_legs,
+                    stp=str(args.get("stp", "cancel_resting")),
+                    margin_spot=bool(args.get("margin_spot", False)),
+                    client_tag=int(args.get("client_tag", 0)),
+                    express_surplus_bid_bps=exp_bid_bps,
+                )
+                if not res.get("ok"):
+                    raise RuntimeError(f"POST /basket rejected: {res}")
+                return self._ok_tool_result(res)
+
+            if name == "arena_portfolio_delta_hedge":
+                aid = self._effective_account(args.get("account_id"))
+                base_aid = int(args.get("base_asset_id", 0))
+                pref_mid = int(args.get("preferred_market_id", 0))
+                max_qty_l = int(args.get("max_qty_lots", 0))
+                max_slip_bps = int(args.get("max_slippage_bps", 200))
+                self._enforce_delta_hedge_notional_cap(
+                    aid=aid,
+                    acct_snap=None,
+                    base_asset_id=base_aid,
+                    preferred_market_id=pref_mid,
+                    max_qty_lots=max_qty_l,
+                    max_slippage_bps=max_slip_bps,
+                )
+                self._preflight_risk_and_builder(aid, risk_increasing=True)
+                res = self.adapter.http.auto_delta_hedge(
+                    account_id=aid,
+                    base_asset_id=base_aid,
+                    preferred_market_id=pref_mid,
+                    max_slippage_bps=max_slip_bps,
+                    max_qty_lots=max_qty_l,
+                    margin_spot=bool(args.get("margin_spot", False)),
+                )
+                if not res.get("ok"):
+                    raise RuntimeError(f"POST /auto_delta_hedge failed: {res}")
+                return self._ok_tool_result(res)
+
+            if name == "arena_request_withdrawal":
+                if not self.allow_withdrawals:
+                    return self._err_tool_result(
+                        "withdrawals_disabled: start arena_mcp_server.py with --allow-withdrawals to enable withdrawals"
+                    )
+                aid = self._effective_account(args.get("account_id"))
+                recip = _norm_eth_address(str(args["recipient_eth_address"]))
+                if self.allowed_withdrawal_recipients is not None and recip not in self.allowed_withdrawal_recipients:
+                    return self._err_tool_result(
+                        f"withdrawal_recipient_not_allowed: {recip} is not in --allowed-withdrawal-recipients"
+                    )
+                asset_id = int(args.get("asset_id", 0))
+                if args.get("amount") is not None:
+                    raw_amt = int(args["amount"])
+                elif asset_id == 0 and args.get("amount_usd") is not None:
+                    raw_amt = usd_to_micro(args["amount_usd"])
+                elif asset_id > 0 and args.get("amount_base") is not None:
+                    raw_amt = base_to_qty_lots(args["amount_base"])
+                else:
+                    raise ValueError("Specify amount, amount_usd (asset_id=0), or amount_base (asset_id>0)")
+                self._enforce_transfer_or_withdrawal_guardrails(
+                    aid=aid, asset_id=asset_id, raw_amount=raw_amt, op_label="withdraw"
+                )
+                res = self.adapter.http.withdraw(
+                    account_id=aid,
+                    amount=raw_amt,
+                    asset_id=asset_id,
+                    recipient_eth_address=recip,
+                )
+                if not res.get("ok"):
+                    raise RuntimeError(f"POST /withdraw rejected: {res}")
+                return self._ok_tool_result(res)
+
+            if name == "arena_subscribe_express_port":
+                aid = self._effective_account(args.get("account_id"))
+                dur_epochs = int(args.get("duration_epochs", 1))
+                max_fee_micro = int(args.get("max_fee_usd_micro", 0))
+                if not (1 <= dur_epochs <= 1_051_200):
+                    raise ValueError("duration_epochs out of [1, 1051200]")
+                if max_fee_micro < 0:
+                    raise ValueError("max_fee_usd_micro must be >= 0")
+                eff_max_fee_micro = max_fee_micro
+                if self.max_order_notional_micro > 0:
+                    if max_fee_micro > self.max_order_notional_micro:
+                        raise PermissionError(
+                            f"max_order_notional_exceeded: express port max_fee_usd_micro "
+                            f"${micro_to_usd_str(max_fee_micro)} exceeds cap "
+                            f"${micro_to_usd_str(self.max_order_notional_micro)}"
+                        )
+                    health_fn = getattr(self.adapter.http, "health", None)
+                    if callable(health_fn):
+                        h = health_fn()
+                        if isinstance(h, dict):
+                            fee_per_ep = int(h.get("express_port_fee_per_epoch_usd_micro", 0))
+                            est_cost = dur_epochs * fee_per_ep
+                            if fee_per_ep > 0 and est_cost > self.max_order_notional_micro:
+                                raise PermissionError(
+                                    f"max_order_notional_exceeded: express port lease cost "
+                                    f"${micro_to_usd_str(est_cost)} exceeds cap "
+                                    f"${micro_to_usd_str(self.max_order_notional_micro)}"
+                                )
+                    eff_max_fee_micro = (
+                        self.max_order_notional_micro
+                        if max_fee_micro == 0
+                        else min(max_fee_micro, self.max_order_notional_micro)
+                    )
+                self._preflight_risk_and_builder(aid, risk_increasing=True)
+                use_bin = bool(args.get("use_binary_wire", False)) and self._has_binary_wire()
+                res = self.adapter.subscribe_express_port(
+                    duration_epochs=dur_epochs,
+                    max_fee_usd_micro=eff_max_fee_micro,
+                    params={"account_id": aid, "use_binary_wire": use_bin},
+                )
+                return self._ok_tool_result(res)
+
+            if name == "arena_preview_order":
+                aid = self._effective_account(args.get("account_id"))
+                m = self._resolve_market_args(args)
+                mid = int(m["market_id"])
+                side_raw = str(args["side"]).strip().lower()
+                is_market = bool(args.get("is_market", False))
+                is_pegged = any(
+                    bool(args.get(f, False))
+                    for f in ("primary_peg", "midpoint_peg", "mark_peg", "trailing_peg", "dark_midpoint")
+                )
+                is_spread = str(m.get("kind", "")).lower() == "spread_book"
+                if is_spread and args.get("differential_usd") is not None:
+                    px_ticks = int(m.get("offset_ticks", 1_000_000)) + usd_to_price_ticks(
+                        args["differential_usd"], allow_zero=True, allow_negative=True
+                    )
+                else:
+                    px_ticks = self._resolve_price_ticks(
+                        args, m, allow_zero=(is_market or is_pegged or is_spread)
+                    )
+                qty_lots = self._resolve_qty_lots(args)
+                params = {
+                    "account_id": aid,
+                    "price_ticks": px_ticks,
+                    "tif": str(args.get("tif", "ioc" if is_market else "gtc")),
+                    "stp": str(args.get("stp", "cancel_resting")),
+                    "reduce_only": bool(args.get("reduce_only", False)),
+                    "margin_spot": bool(args.get("margin_spot", False)),
+                    "post_only_slide": bool(args.get("post_only_slide", False)),
+                    "primary_peg": bool(args.get("primary_peg", False)),
+                    "midpoint_peg": bool(args.get("midpoint_peg", False)),
+                    "mark_peg": bool(args.get("mark_peg", False)),
+                    "trailing_peg": bool(args.get("trailing_peg", False)),
+                    "dark_midpoint": bool(args.get("dark_midpoint", False)),
+                    "oco_linked": bool(args.get("oco_linked", False)),
+                    "stp_decrement_and_cancel": bool(args.get("stp_decrement_and_cancel", False)),
+                    "client_tag": int(args.get("client_tag", 0)),
+                    "min_qty_lots": int(args.get("min_qty_lots", 0)),
+                    "display_qty_lots": int(args.get("display_qty_lots", 0)),
+                    "auto_skew_ticks": int(args.get("auto_skew_ticks", 0)),
+                    "auto_flip_ticks": int(args.get("auto_flip_ticks", 0)),
+                    "peg_offset_ticks": int(args.get("peg_offset_ticks", 0)),
+                    "max_lifetime_wal_seqs": int(args.get("max_lifetime_wal_seqs", 0)),
+                    "jit_elastic_mult": int(args.get("jit_elastic_mult", 0)),
+                    "priority_fee_ppm": int(args.get("priority_fee_ppm", 0)),
+                }
+                res = self.adapter.preview_order(
+                    mid,
+                    "market" if is_market else "limit",
+                    side_raw,
+                    qty_lots_to_base_str(qty_lots),
+                    None,
+                    params=params,
+                )
+                res["would_accept"] = bool(res.get("wouldAccept", False))
+                return self._ok_tool_result(res)
+
+            if name == "arena_flash_arbitrage":
+                aid = self._effective_account(args.get("account_id"))
+                m = self._resolve_market_args(args)
+                mid = int(m["market_id"])
+                side_raw = str(args["side"]).strip().lower()
+                if side_raw in ("buy", "bid", "mint", "mint_and_sell"):
+                    side_str = "bid"
+                elif side_raw in ("sell", "ask", "redeem", "buy_and_redeem"):
+                    side_str = "ask"
+                else:
+                    raise ValueError(
+                        f"Invalid flash_arbitrage side {side_raw!r}; expected buy|sell|bid|ask|mint|redeem"
+                    )
+                qty_lots = self._resolve_qty_lots(args)
+                is_market = bool(args.get("is_market", True))
+                lim_px = (
+                    usd_to_price_ticks(args["limit_price_usd"])
+                    if args.get("limit_price_usd") is not None
+                    else int(args.get("limit_price_ticks", 0))
+                )
+                min_prof_micro = (
+                    usd_to_micro(args["min_profit_usd"], allow_zero=True, allow_negative=True)
+                    if args.get("min_profit_usd") is not None
+                    else int(args.get("min_profit_micro", 0))
+                )
+                exp_bid_bps = int(args.get("express_surplus_bid_bps", 0))
+                if not (0 <= exp_bid_bps <= 5000):
+                    raise ValueError(f"express_surplus_bid_bps {exp_bid_bps} out of [0, 5000]")
+                flash_px_hint = max(abs(lim_px), int(m.get("claim_cap_ticks", 0)))
+                self._enforce_notional_cap(
+                    market=m,
+                    side_str=side_str,
+                    price_ticks=flash_px_hint,
+                    qty_lots=qty_lots,
+                    reduce_only=False,
+                    is_pegged_or_market=True,
+                )
+                self._preflight_risk_and_builder(aid, risk_increasing=True)
+                stp_s = str(args.get("stp", "cancel_resting")).strip().lower()
+                if bool(args.get("use_binary_wire", False)) and self._has_binary_wire():
+                    bin_cli = self.adapter._ensure_binary(account_id=aid)
+                    stp_map_fa = {
+                        "cancel_resting": StpMode.CANCEL_RESTING,
+                        "cancel_incoming": StpMode.CANCEL_INCOMING,
+                        "cancel_both": StpMode.CANCEL_BOTH,
+                        "none": StpMode.NONE,
+                    }
+                    wres = bin_cli.flash_arbitrage(
+                        market_id=mid,
+                        side=OrderSide.BID if side_str == "bid" else OrderSide.ASK,
+                        qty_lots=qty_lots,
+                        limit_price_ticks=lim_px,
+                        min_profit_micro=min_prof_micro,
+                        is_market=is_market,
+                        stp=stp_map_fa[stp_s],
+                        express_surplus_bid_bps=exp_bid_bps,
+                        account_id=aid,
+                    )
+                    if wres.status_code != WireStatusCode.OK:
+                        raise RuntimeError(f"Wire flash_arbitrage rejected ({wres.status_code.name})")
+                    return self._ok_tool_result(
+                        {
+                            "ok": True,
+                            "status": wres.status_code.name,
+                            "wal_seq": int(wres.wal_seq),
+                            "filled_lots": int(wres.filled_lots),
+                            "avg_price_ticks": int(wres.avg_price_ticks),
+                            "net_profit_micro": int(wres.fee_or_position),
+                        }
+                    )
+                res = self.adapter.http.flash_arbitrage(
+                    account_id=aid,
+                    market_id=mid,
+                    side=side_str,
+                    qty_lots=qty_lots,
+                    limit_price_ticks=lim_px,
+                    min_profit_micro=min_prof_micro,
+                    is_market=is_market,
+                    stp=stp_s,
+                    express_surplus_bid_bps=exp_bid_bps,
+                )
+                if not res.get("ok"):
+                    raise RuntimeError(f"POST /flash_arb rejected: {res}")
+                return self._ok_tool_result(res)
+
+            if name == "arena_auto_liquidate":
+                liq_aid = self._effective_account(args.get("liquidator_account_id"))
+                mid = int(args.get("market_id", 0))
+                target_aid = int(args.get("target_account_id", 0))
+                max_lots = int(args.get("max_lots", 0))
+                if max_lots < 0:
+                    raise ValueError(f"max_lots must be >= 0, got {max_lots}")
+                min_bounty_micro = (
+                    usd_to_micro(args["min_bounty_usd"], allow_zero=True)
+                    if args.get("min_bounty_usd") is not None
+                    else int(args.get("min_bounty_micro", 0))
+                )
+                if min_bounty_micro < 0:
+                    raise ValueError(f"min_bounty_micro must be >= 0, got {min_bounty_micro}")
+                flash_offload = bool(args.get("flash_offload_to_book", True))
+                bounty_bid_bps = int(args.get("bounty_rebate_bid_bps", 0))
+                if not (0 <= bounty_bid_bps <= 9000):
+                    raise ValueError(f"bounty_rebate_bid_bps {bounty_bid_bps} out of [0, 9000]")
+                if self.max_order_notional_micro > 0:
+                    if mid <= 0 or max_lots <= 0:
+                        raise PermissionError(
+                            "max_order_notional_exceeded: auto_liquidate requires explicit market_id > 0 and max_lots > 0 when --max-order-notional-usd is enabled"
+                        )
+                    m = self.adapter.resolve_market(mid)
+                    self._enforce_notional_cap(
+                        market=m,
+                        side_str="bid",
+                        price_ticks=0,
+                        qty_lots=max_lots,
+                        reduce_only=False,
+                        is_pegged_or_market=True,
+                    )
+                self._preflight_risk_and_builder(liq_aid, risk_increasing=True)
+                res = self.adapter.http.auto_liquidate(
+                    liquidator_account_id=liq_aid,
+                    market_id=mid,
+                    target_account_id=target_aid,
+                    max_lots=max_lots,
+                    min_bounty_micro=min_bounty_micro,
+                    flash_offload_to_book=flash_offload,
+                    stp=str(args.get("stp", "cancel_resting")).strip().lower(),
+                    hedge_margin_spot=bool(args.get("hedge_margin_spot", False)),
+                    bounty_rebate_bid_bps=bounty_bid_bps,
+                )
+                if not res.get("ok"):
+                    raise RuntimeError(f"POST /auto_liquidate rejected: {res}")
+                return self._ok_tool_result(res)
+
+            if name == "arena_onboard_and_deposit":
+                gen = bool(args.get("generate_ephemeral", False))
+                eff_rpc = self._validate_caller_rpc_url(str(args.get("rpc_url") or "").strip())
+                out_onb: Dict[str, Any] = {"ok": True}
+                if gen or not self.adapter.account_id:
+                    login_res = self.call_tool("arena_login_wallet", {"generate_ephemeral": gen})
+                    if login_res.get("isError"):
+                        return login_res
+                    out_onb["login"] = json.loads(login_res["content"][0]["text"])
+                if not self._wallet_privkey_hex:
+                    raise ValueError(
+                        "No wallet private key available; pass generate_ephemeral=true or configure --wallet-privkey"
+                    )
+                signer = EthWalletSigner(self._wallet_privkey_hex)
+                aid = self._effective_account(None)
+                out_onb["account_id"] = aid
+                out_onb["eth_address"] = signer.address
+                asset_sym = str(args.get("asset_symbol") or "USD").strip().upper()
+                if bool(args.get("request_faucet", True)):
+                    faucet_amt = args.get("faucet_amount", "10000")
+                    f_res = self.adapter.http.request_testnet_faucet(
+                        recipient=signer.address,
+                        amount=faucet_amt,
+                        asset=asset_sym,
+                        drip_gas=bool(args.get("drip_gas", True)),
+                    )
+                    if not f_res.get("ok"):
+                        raise RuntimeError(f"POST /faucet rejected: {f_res}")
+                    out_onb["faucet"] = f_res
+                if bool(args.get("deposit_onchain", False)):
+                    dep_amt = args.get("deposit_amount")
+                    if dep_amt is None:
+                        dep_amt = args.get("faucet_amount", "10000")
+                    if self.max_order_notional_micro > 0:
+                        if asset_sym in ("USD", "USDC", "MUSDC"):
+                            dep_micro = usd_to_micro(dep_amt)
+                        else:
+                            dep_lots = base_to_qty_lots(dep_amt)
+                            ref_px = 0
+                            for cand_sym in (f"{asset_sym}-USD-SPOT", f"{asset_sym}-USD-PERP", f"{asset_sym}/USD", f"{asset_sym}/USD:USD"):
+                                try:
+                                    cm = self.adapter.resolve_market(cand_sym)
+                                    ref_px = self._lookup_ref_ticks(int(cm["market_id"]), "bid")
+                                    if ref_px > 0:
+                                        break
+                                except Exception as mkt_err:
+                                    _ = mkt_err
+                            if ref_px <= 0:
+                                raise PermissionError(
+                                    f"max_order_notional_exceeded: unavailable reference price for deposit asset {asset_sym}"
+                                )
+                            dep_micro = dep_lots * ref_px
+                        if dep_micro > self.max_order_notional_micro:
+                            raise PermissionError(
+                                f"max_order_notional_exceeded: deposit ${micro_to_usd_str(dep_micro)} exceeds cap ${micro_to_usd_str(self.max_order_notional_micro)}"
+                            )
+                    d_res = self.adapter.http.deposit_onchain_margin(
+                        signer=signer,
+                        amount=dep_amt,
+                        account_id=aid,
+                        asset_symbol=asset_sym,
+                        rpc_url=eff_rpc,
+                        clearinghouse_address=self.clearinghouse,
+                        wait_for_credit=bool(args.get("wait_for_credit", True)),
+                        poll_timeout_sec=float(args.get("poll_timeout_sec", 30.0)),
+                    )
+                    out_onb["deposit"] = d_res
+                return self._ok_tool_result(out_onb)
+
+            raise KeyError(f"Unhandled tool: {name!r}")
+        except Exception as exc:
+            return self._err_tool_result(self._scrub_secret_text(str(exc)))
+
+    def handle_jsonrpc_message(self, msg: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(msg, dict):
+            return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
+        has_id = "id" in msg
+        req_id = msg.get("id")
+        if msg.get("jsonrpc") != "2.0" or not isinstance(msg.get("method"), str):
+            if not has_id:
+                return None
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32600, "message": "Invalid Request"}}
+        method = msg["method"]
+        params = msg.get("params")
+        if params is not None and not isinstance(params, dict):
+            if not has_id:
+                return None
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "Invalid params"}}
+        p = params or {}
+
+        if not has_id:
+            if method == "notifications/initialized":
+                self._initialized = True
+            return None
+
+        if method == "initialize":
+            client_ver = str(p.get("protocolVersion") or MCP_PROTOCOL_VERSION)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "protocolVersion": client_ver if client_ver in ("2024-11-05", "2025-03-26") else MCP_PROTOCOL_VERSION,
+                    "capabilities": {
+                        "tools": {"listChanged": False},
+                        "resources": {"subscribe": False, "listChanged": False},
+                    },
+                    "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                },
+            }
+
+        if method == "ping":
+            return {"jsonrpc": "2.0", "id": req_id, "result": {}}
+
+        if method == "tools/list":
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": self.list_tools()}}
+
+        if method == "tools/call":
+            tname = p.get("name")
+            targs = p.get("arguments")
+            if not isinstance(tname, str) or not tname:
+                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "Missing tool name"}}
+            if targs is not None and not isinstance(targs, dict):
+                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "Tool arguments must be object"}}
+            try:
+                res = self.call_tool(tname, targs)
+            except KeyError:
+                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": f"Unknown tool: {tname}"}}
+            return {"jsonrpc": "2.0", "id": req_id, "result": res}
+
+        if method == "resources/list":
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": self.list_resources()}}
+
+        if method == "resources/read":
+            uri = p.get("uri")
+            if not isinstance(uri, str) or not uri:
+                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "Missing resource uri"}}
+            try:
+                res = self.read_resource(uri)
+            except ValueError as exc:
+                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": self._scrub_secret_text(str(exc))}}
+            except Exception as exc:
+                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32603, "message": self._scrub_secret_text(str(exc))}}
+            return {"jsonrpc": "2.0", "id": req_id, "result": res}
+
+        return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
+
+    def dispatch_raw_payload(self, raw_bytes: bytes) -> Any:
+        with self._dispatch_lock:
+            try:
+                decoded = json.loads(raw_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
+            if isinstance(decoded, list):
+                if not decoded:
+                    return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
+                if len(decoded) > 64:
+                    return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Batch exceeds 64 requests"}}
+                replies: List[Dict[str, Any]] = []
+                for item in decoded:
+                    rep = self.handle_jsonrpc_message(item)
+                    if rep is not None:
+                        replies.append(rep)
+                return replies if replies else None
+            return self.handle_jsonrpc_message(decoded)
+
+    def create_http_server(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8765,
+        bearer_token: str = "",
+    ) -> http.server.ThreadingHTTPServer:
+        gw_ref = self
+        expected_tok = str(bearer_token or "").strip()
+
+        class _McpHttpServer(http.server.ThreadingHTTPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+            request_queue_size = 64
+
+        class _McpHttpHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            timeout = 15.0
+
+            def log_message(self, fmt: str, *args: Any) -> None:
+                _ = (fmt, args)
+
+            def _check_bearer(self) -> bool:
+                if not expected_tok:
+                    return True
+                auth_hdr = str(self.headers.get("Authorization", "")).strip()
+                if not auth_hdr.lower().startswith("bearer "):
+                    return False
+                got = auth_hdr[7:].strip()
+                return hmac.compare_digest(got.encode("utf-8"), expected_tok.encode("utf-8"))
+
+            def _drain_unconsumed_body(self) -> None:
+                if getattr(self, "_body_consumed", False):
+                    return
+                self._body_consumed = True
+                if self.headers is None or self.headers.get("Transfer-Encoding") is not None:
+                    return
+                cl_all = self.headers.get_all("Content-Length") or []
+                if len(cl_all) != 1 or "," in str(cl_all[0]):
+                    return
+                try:
+                    clen = int(cl_all[0])
+                except ValueError:
+                    return
+                if clen <= 0 or clen > 65_536:
+                    return
+                prev_timeout = self.connection.gettimeout()
+                try:
+                    self.connection.settimeout(0.5)
+                    rem = clen
+                    while rem > 0:
+                        chunk = self.rfile.read(min(rem, 16_384))
+                        if not chunk:
+                            break
+                        rem -= len(chunk)
+                except OSError:
+                    return
+                finally:
+                    try:
+                        self.connection.settimeout(prev_timeout)
+                    except OSError as restore_err:
+                        _ = restore_err
+
+            def _send_json_bytes(
+                self,
+                status_code: int,
+                body_bytes: bytes,
+                extra_headers: Optional[Dict[str, str]] = None,
+            ) -> None:
+                self._drain_unconsumed_body()
+                self.send_response(status_code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body_bytes)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Connection", "close")
+                if extra_headers:
+                    for hk, hv in extra_headers.items():
+                        self.send_header(hk, hv)
+                self.end_headers()
+                if body_bytes:
+                    self.wfile.write(body_bytes)
+                self.close_connection = True
+
+            def do_OPTIONS(self) -> None:
+                self._send_json_bytes(204, b"")
+
+            def do_GET(self) -> None:
+                path_clean = self.path.split("?", 1)[0]
+                if path_clean in ("/mcp/health", "/health"):
+                    body = _json_dumps(
+                        {
+                            "ok": True,
+                            "server": SERVER_NAME,
+                            "version": SERVER_VERSION,
+                            "protocolVersion": MCP_PROTOCOL_VERSION,
+                            "transport": "streamable-http",
+                            "read_only": gw_ref.read_only,
+                            "tool_count": len(gw_ref.list_tools()),
+                        }
+                    ).encode("utf-8")
+                    self._send_json_bytes(200, body)
+                    return
+                if path_clean in ("/mcp", "/"):
+                    self._send_json_bytes(
+                        405,
+                        b'{"ok":false,"error":"method_not_allowed_use_post"}',
+                        extra_headers={"Allow": "POST, OPTIONS"},
+                    )
+                    return
+                self._send_json_bytes(404, b'{"ok":false,"error":"not_found"}')
+
+            def do_POST(self) -> None:
+                path_clean = self.path.split("?", 1)[0]
+                if path_clean not in ("/mcp", "/"):
+                    self._send_json_bytes(404, b'{"ok":false,"error":"not_found"}')
+                    return
+                if not self._check_bearer():
+                    self._send_json_bytes(401, b'{"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"Unauthorized"}}')
+                    return
+                if self.headers.get("Transfer-Encoding") is not None:
+                    self._send_json_bytes(400, b'{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Transfer-Encoding unsupported"}}')
+                    return
+                clen_all = self.headers.get_all("Content-Length") or []
+                if len(clen_all) > 1 or any("," in str(v) for v in clen_all):
+                    self._send_json_bytes(400, b'{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Duplicate Content-Length"}}')
+                    return
+                clen_str = clen_all[0] if clen_all else "0"
+                try:
+                    clen = int(clen_str)
+                except ValueError:
+                    self._send_json_bytes(400, b'{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Invalid Content-Length"}}')
+                    return
+                if clen < 0 or clen > MAX_STDIO_MESSAGE_BYTES:
+                    self._send_json_bytes(413, b'{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Payload Too Large"}}')
+                    return
+                self._body_consumed = True
+                raw_payload = self.rfile.read(clen) if clen > 0 else b""
+                reply = gw_ref.dispatch_raw_payload(raw_payload)
+                if reply is None:
+                    self._send_json_bytes(202, b"")
+                    return
+                out_bytes = _json_dumps(reply).encode("utf-8")
+                self._send_json_bytes(200, out_bytes)
+
+        return _McpHttpServer((host, int(port)), _McpHttpHandler)
+
+    def serve_http(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8765,
+        bearer_token: str = "",
+    ) -> int:
+        srv = self.create_http_server(host=host, port=port, bearer_token=bearer_token)
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            return 0
+        finally:
+            srv.server_close()
+        return 0
+
+    def serve_stdio(self, stdin_stream: BinaryIO, stdout_stream: BinaryIO) -> int:
+        transport = McpStdioTransport(stdin_stream, stdout_stream)
+        while True:
+            use_cl = False
+            try:
+                raw_payload, use_cl = transport.read_message()
+            except ValueError as exc:
+                err_resp = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": self._scrub_secret_text(str(exc))}}
+                transport.write_message(err_resp, use_cl)
+                continue
+            if raw_payload is None:
+                return 0
+            reply = self.dispatch_raw_payload(raw_payload)
+            if reply is not None:
+                transport.write_message(reply, use_cl)
+
+
+def resolve_arena_base_url(
+    explicit_url: str = "",
+    *,
+    testnet: bool = False,
+    network: str = "",
+    env: Optional[Dict[str, str]] = None,
+) -> str:
+    env_map = os.environ if env is None else env
+    raw_url = str(explicit_url or "").strip()
+    if raw_url:
+        return raw_url.rstrip("/")
+    cli_net = str(network or "").strip().lower()
+    if bool(testnet) or cli_net in ("testnet", "public-testnet", "base-sepolia", "sepolia", "feraterra"):
+        return PUBLIC_TESTNET_ARENA_URL
+    if cli_net in ("local", "localhost"):
+        return DEFAULT_LOCAL_ARENA_URL
+    if cli_net:
+        raise ValueError(f"Unknown --network preset: {cli_net!r}")
+    for env_k in ("ARENA_URL", "ARENA_BASE_URL"):
+        env_v = str(env_map.get(env_k, "")).strip()
+        if env_v:
+            return env_v.rstrip("/")
+    env_net = str(env_map.get("ARENA_NETWORK", "")).strip().lower()
+    env_testnet = str(env_map.get("ARENA_TESTNET", "")).strip().lower() in ("1", "true", "yes", "on")
+    if env_testnet or env_net in ("testnet", "public-testnet", "base-sepolia", "sepolia", "feraterra"):
+        return PUBLIC_TESTNET_ARENA_URL
+    if env_net in ("", "local", "localhost"):
+        return DEFAULT_LOCAL_ARENA_URL
+    raise ValueError(f"Unknown ARENA_NETWORK preset: {env_net!r}")
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Arena Exchange v4.9 MCP JSON-RPC 2.0 stdio & Streamable HTTP Gateway")
+    p.add_argument("--arena-url", "--http-url", "--base-url", "--url", dest="arena_url", default="")
+    p.add_argument("--testnet", action="store_true", default=False, help=f"Connect to the live public Base Sepolia testnet ({PUBLIC_TESTNET_ARENA_URL})")
+    p.add_argument("--network", default="", help="Optional network preset: local or testnet")
+    p.add_argument("--tcp-host", default=os.environ.get("ARENA_TCP_HOST", ""))
+    p.add_argument("--tcp-port", type=int, default=int(os.environ.get("ARENA_TCP_PORT", "0") or 0))
+    p.add_argument("--http-listen-host", default=os.environ.get("ARENA_MCP_HTTP_HOST", "127.0.0.1"))
+    p.add_argument("--http-listen-port", type=int, default=int(os.environ.get("ARENA_MCP_HTTP_PORT", "0") or 0))
+    p.add_argument("--http-bearer-token", default=os.environ.get("ARENA_MCP_HTTP_BEARER_TOKEN", ""))
+    p.add_argument("--account-id", type=int, default=int(os.environ.get("ARENA_ACCOUNT_ID", "0") or 0))
+    p.add_argument("--api-key", default=os.environ.get("ARENA_API_KEY", ""))
+    p.add_argument("--api-secret", default=os.environ.get("ARENA_API_SECRET", ""))
+    p.add_argument("--creds-file", default=os.environ.get("ARENA_CREDS_FILE", ""))
+    p.add_argument("--wallet-privkey", default=os.environ.get("ARENA_WALLET_PRIVKEY", ""))
+    p.add_argument("--wallet-privkey-file", default=os.environ.get("ARENA_WALLET_PRIVKEY_FILE", ""))
+    p.add_argument("--rpc-url", default=os.environ.get("ARENA_RPC_URL", ""))
+    p.add_argument("--clearinghouse", default=os.environ.get("ARENA_CLEARINGHOUSE", ""))
+    p.add_argument("--expected-operator-address", default=os.environ.get("ARENA_EXPECTED_OPERATOR_ADDRESS", ""))
+    p.add_argument("--read-only", action="store_true", default=_env_truthy("ARENA_MCP_READ_ONLY", False))
+    p.add_argument("--allowed-accounts", default=os.environ.get("ARENA_MCP_ALLOWED_ACCOUNTS", ""))
+    p.add_argument("--max-order-notional-usd", default=os.environ.get("ARENA_MCP_MAX_ORDER_NOTIONAL_USD", "0"))
+    p.add_argument("--require-drawdown-stop", action="store_true", default=_env_truthy("ARENA_MCP_REQUIRE_DRAWDOWN_STOP", False))
+    p.add_argument("--min-drawdown-stop-usd", default=os.environ.get("ARENA_MCP_MIN_DRAWDOWN_STOP_USD", "0"))
+    p.add_argument("--default-builder-account", type=int, default=int(os.environ.get("ARENA_MCP_DEFAULT_BUILDER_ACCOUNT", "0") or 0))
+    p.add_argument("--default-builder-bps", type=int, default=int(os.environ.get("ARENA_MCP_DEFAULT_BUILDER_BPS", "0") or 0))
+    p.add_argument("--allow-withdrawals", action="store_true", default=_env_truthy("ARENA_MCP_ALLOW_WITHDRAWALS", False))
+    p.add_argument("--allowed-withdrawal-recipients", default=os.environ.get("ARENA_MCP_ALLOWED_WITHDRAWAL_RECIPIENTS", ""))
+    p.add_argument("--allow-wallet-login", action="store_true", default=_env_truthy("ARENA_MCP_ALLOW_WALLET_LOGIN", False))
+    p.add_argument("--timeout", type=float, default=5.0)
+    p.add_argument("--self-test", action="store_true")
+    ns = p.parse_args(argv)
+    ns.arena_url = resolve_arena_base_url(ns.arena_url, testnet=bool(ns.testnet), network=str(ns.network))
+    return ns
+
+
+def _run_mcp_self_test() -> None:
+    # 1. Fixed-point Decimal conversions (exact without rounding)
+    assert usd_to_price_ticks("70000.25") == 7_000_025
+    assert price_ticks_to_usd_str(7_000_025) == "70000.25"
+    assert price_ticks_to_usd_str(10_000_000) == "100000"
+    assert base_to_qty_lots("1.2500") == 12_500
+    assert qty_lots_to_base_str(12_500) == "1.25"
+    assert usd_to_micro("25000.123456") == 25_000_123_456
+    assert micro_to_usd_str(25_000_123_456) == "25000.123456"
+    for bad_fn, bad_val in ((usd_to_price_ticks, "100.005"), (base_to_qty_lots, "0.00001"), (usd_to_micro, "1.0000001")):
+        try:
+            bad_fn(bad_val)
+            raise AssertionError(f"Expected ValueError for {bad_val}")
+        except ValueError as err:
+            assert "exact multiple" in str(err)
+
+    # 2. Dual JSONL + Content-Length stdio framing + batch notifications + parse/method errors
+    gw = ArenaMcpGateway(
+        account_id=2,
+        read_only=False,
+        allowed_accounts=frozenset({2, 3}),
+        max_order_notional_micro=usd_to_micro("25000"),
+        require_drawdown_stop=True,
+        default_builder_account=9,
+        default_builder_bps=1000,
+        allow_withdrawals=False,
+    )
+    gw.adapter.markets_by_symbol = {
+        "BTC-USD-PERP": {
+            "id": "1",
+            "numericId": 1,
+            "symbol": "BTC/USD:USD",
+            "nativeSymbol": "BTC-USD-PERP",
+            "kind": "linear_perpetual",
+            "info": {"market_id": 1, "symbol": "BTC-USD-PERP", "kind": "linear_perpetual", "base_asset_id": 1},
+        },
+        "ETH-USD-PERP": {
+            "id": "2",
+            "numericId": 2,
+            "symbol": "ETH/USD:USD",
+            "nativeSymbol": "ETH-USD-PERP",
+            "kind": "linear_perpetual",
+            "info": {"market_id": 2, "symbol": "ETH-USD-PERP", "kind": "linear_perpetual", "base_asset_id": 2},
+        },
+        "BTC-ETH-SPRD": {
+            "id": "17",
+            "numericId": 17,
+            "symbol": "BTC-ETH-SPRD",
+            "nativeSymbol": "BTC-ETH-SPRD",
+            "kind": "spread_book",
+            "info": {"market_id": 17, "symbol": "BTC-ETH-SPRD", "kind": "spread_book", "base_asset_id": 1},
+        },
+        "BTC-BASIS-SPRD": {
+            "id": "18",
+            "numericId": 18,
+            "symbol": "BTC-BASIS-SPRD",
+            "nativeSymbol": "BTC-BASIS-SPRD",
+            "kind": "spread_book",
+            "info": {
+                "market_id": 18,
+                "symbol": "BTC-BASIS-SPRD",
+                "kind": "spread_book",
+                "base_asset_id": 1,
+                "ref_market_1": 1,
+                "ref_market_2": 2,
+                "ref_markets": [1, 2, 0],
+            },
+        },
+    }
+    gw.adapter.markets_by_id = {
+        1: gw.adapter.markets_by_symbol["BTC-USD-PERP"],
+        2: gw.adapter.markets_by_symbol["ETH-USD-PERP"],
+        17: gw.adapter.markets_by_symbol["BTC-ETH-SPRD"],
+        18: gw.adapter.markets_by_symbol["BTC-BASIS-SPRD"],
+    }
+    gw.adapter.unified_to_native = {
+        "BTC-USD-PERP": "BTC-USD-PERP",
+        "BTC/USD:USD": "BTC-USD-PERP",
+        "1": "BTC-USD-PERP",
+        "ETH-USD-PERP": "ETH-USD-PERP",
+        "ETH/USD:USD": "ETH-USD-PERP",
+        "2": "ETH-USD-PERP",
+        "BTC-ETH-SPRD": "BTC-ETH-SPRD",
+        "17": "BTC-ETH-SPRD",
+        "BTC-BASIS-SPRD": "BTC-BASIS-SPRD",
+        "18": "BTC-BASIS-SPRD",
+    }
+
+    class _StubHttp:
+        def __init__(self) -> None:
+            self.api_key = ""
+            self.api_secret = ""
+            self.bound: List[tuple[int, int, int]] = []
+            self.dd_micro = 0
+            self.orders: List[Dict[str, Any]] = []
+            self.open_orders: List[Dict[str, Any]] = []
+            self.perp_positions: List[Dict[str, Any]] = []
+            self.base_balances: List[Dict[str, Any]] = []
+            self.quotes: List[Dict[str, Any]] = []
+            self.edits: List[Dict[str, Any]] = []
+            self.baskets: List[Dict[str, Any]] = []
+            self.hedges: List[Dict[str, Any]] = []
+
+        def account(self, aid: int) -> Dict[str, Any]:
+            return {
+                "ok": True,
+                "account_id": aid,
+                "drawdown_stop_equity_micro": self.dd_micro,
+                "builder_account_id": 0,
+                "open_orders": list(self.open_orders),
+                "perp_positions": list(self.perp_positions),
+                "base_balances": list(self.base_balances),
+            }
+
+        def set_drawdown_stop(self, aid: int, drawdown_stop_usd_micro: int) -> Dict[str, Any]:
+            _ = aid
+            self.dd_micro = int(drawdown_stop_usd_micro)
+            return {"ok": True, "drawdown_stop_equity_micro": self.dd_micro}
+
+        def bind_builder_code(self, trader_aid: int, builder_aid: int, bps: int) -> Dict[str, Any]:
+            self.bound.append((trader_aid, builder_aid, bps))
+            return {"ok": True}
+
+        def health(self) -> Dict[str, Any]:
+            return {"ok": True, "express_port_fee_per_epoch_usd_micro": 250_000}
+
+        def get_leaderboard(self, limit: int = 25, sort: str = "equity") -> Dict[str, Any]:
+            return {
+                "ok": True,
+                "wal_seq": 100,
+                "sort": sort,
+                "limit": int(limit),
+                "total_ranked_accounts": 1,
+                "entries": [
+                    {
+                        "rank": 1,
+                        "account_id": 2,
+                        "wallet_masked": "0x1234...abcd",
+                        "total_equity_micro": 12_500_000_000,
+                        "total_equity_usd": "12500.00",
+                        "net_pnl_micro": 2_500_000_000,
+                        "net_pnl_usd": "2500.00",
+                    }
+                ],
+            }
+
+        def book(self, mid: int, depth: int = 20) -> Dict[str, Any]:
+            _ = depth
+            if int(mid) == 17:
+                return {"ok": True, "market_id": 17, "mark_price_ticks": 0, "best_ask_ticks": 0, "best_bid_ticks": 0}
+            if int(mid) == 18:
+                return {"ok": True, "market_id": 18, "mark_price_ticks": 1_000_000, "best_ask_ticks": 1_000_050, "best_bid_ticks": 999_950}
+            if int(mid) == 2:
+                return {"ok": True, "market_id": 2, "mark_price_ticks": 300_000, "best_ask_ticks": 300_050, "best_bid_ticks": 299_950}
+            return {"ok": True, "market_id": mid, "mark_price_ticks": 6_000_000, "best_ask_ticks": 6_000_100, "best_bid_ticks": 5_999_900}
+
+        def ticker(self, mid: int) -> Dict[str, Any]:
+            if int(mid) == 17:
+                return {"ok": True, "ticker": {"mark_price_ticks": 0, "best_ask_ticks": 0, "best_bid_ticks": 0, "last_trade_price_ticks": 0}}
+            if int(mid) == 18:
+                return {"ok": True, "ticker": {"mark_price_ticks": 1_000_000, "best_ask_ticks": 1_000_050, "best_bid_ticks": 999_950}}
+            if int(mid) == 2:
+                return {"ok": True, "ticker": {"mark_price_ticks": 300_000, "best_ask_ticks": 300_050, "best_bid_ticks": 299_950}}
+            return {"ok": True, "ticker": {"mark_price_ticks": 6_000_000, "best_ask_ticks": 6_000_100, "best_bid_ticks": 5_999_900}}
+
+        def place_order(self, **kwargs: Any) -> Dict[str, Any]:
+            self.orders.append(kwargs)
+            return {"ok": True, "order_id": 77, "order_status": "resting", "filled_lots": 0, "resting_lots": kwargs["qty_lots"], "wal_seq": 101}
+
+        def preview_order(self, **kwargs: Any) -> Dict[str, Any]:
+            return {
+                "ok": True,
+                "preview": True,
+                "would_accept": True,
+                "status": "Ok",
+                "wal_seq": 100,
+                "effective_price_ticks": kwargs["price_ticks"],
+                "estimated_filled_lots": kwargs["qty_lots"],
+                "estimated_resting_lots": 0,
+                "estimated_avg_price_ticks": kwargs["price_ticks"],
+                "estimated_net_fee_micro": 0,
+                "pre_imr_micro": 0,
+                "post_imr_micro": 250_000_000,
+                "post_free_margin_micro": 9_750_000_000,
+            }
+
+        def flash_arbitrage(self, **kwargs: Any) -> Dict[str, Any]:
+            return {"ok": True, "status": "Ok", "wal_seq": 108, "filled_lots": kwargs["qty_lots"], "net_profit_micro": 50_000}
+
+        def auto_liquidate(self, **kwargs: Any) -> Dict[str, Any]:
+            _ = kwargs
+            return {"ok": True, "status": "Ok", "wal_seq": 109, "liquidated_accounts": 1, "bounty_earned_micro": 125_000}
+
+        def login_with_wallet(self, signer: EthWalletSigner) -> Dict[str, Any]:
+            self.api_key = "ephem_k"
+            self.api_secret = "ephem_s"
+            return {"ok": True, "account_id": 3, "eth_address": signer.address, "role": "trader", "wire_key_lo64": 11, "wire_key_hi64": 22}
+
+        def request_testnet_faucet(self, recipient: str, amount: Any = "10000", asset: str = "USD", drip_gas: bool = False) -> Dict[str, Any]:
+            return {"ok": True, "recipient": recipient, "amount": str(amount), "asset": asset, "drip_gas": bool(drip_gas), "tx_hash": "0x" + ("33" * 32)}
+
+        def quote_replace(self, **kwargs: Any) -> Dict[str, Any]:
+            self.quotes.append(kwargs)
+            return {"ok": True, "order_id": 88, "wal_seq": 104}
+
+        def modify_order(self, **kwargs: Any) -> Dict[str, Any]:
+            self.edits.append(kwargs)
+            return {"ok": True, "order_id": kwargs["order_id"], "resting_lots": kwargs["qty_lots"], "wal_seq": 105}
+
+        def execute_basket(self, **kwargs: Any) -> Dict[str, Any]:
+            self.baskets.append(kwargs)
+            return {"ok": True, "wal_seq": 106}
+
+        def auto_delta_hedge(self, **kwargs: Any) -> Dict[str, Any]:
+            self.hedges.append(kwargs)
+            return {"ok": True, "hedged_lots": 100, "wal_seq": 107}
+
+        def cancel_all(self, **kwargs: Any) -> Dict[str, Any]:
+            return {"ok": True, "canceled_orders": 1, "wal_seq": 102}
+
+        def subscribe_express_port(
+            self, account_id: int, duration_epochs: int = 1, max_fee_usd_micro: int = 0
+        ) -> Dict[str, Any]:
+            fee = int(duration_epochs) * 250_000
+            if max_fee_usd_micro > 0 and fee > max_fee_usd_micro:
+                return {"ok": False, "status": "RejectInsufficient"}
+            return {
+                "ok": True,
+                "status": "Ok",
+                "wal_seq": 103,
+                "account_id": account_id,
+                "epochs_purchased": int(duration_epochs),
+                "lease_epochs_remaining": int(duration_epochs),
+                "fee_paid_usd_micro": fee,
+                "fee_per_epoch_usd_micro": 250_000,
+                "free_usd_after_micro": 10_000_000 - fee,
+            }
+
+        def close(self) -> None:
+            return None
+
+    stub = _StubHttp()
+    gw.adapter.http.close()
+    gw.adapter.http = stub  # type: ignore[assignment]
+
+    try:
+        # Check framing loop on real BytesIO streams
+        init_req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}}).encode("utf-8")
+        notif = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}).encode("utf-8")
+        cl_req = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).encode("utf-8")
+        cl_frame = f"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: {len(cl_req)}\r\n\r\n".encode("ascii") + cl_req
+        in_stream = io.BytesIO(init_req + b"\n" + notif + b"\n" + cl_frame)
+        out_stream = io.BytesIO()
+        assert gw.serve_stdio(in_stream, out_stream) == 0
+        raw_out = out_stream.getvalue()
+        nl_idx = raw_out.index(b"\n")
+        resp1 = json.loads(raw_out[:nl_idx].decode("utf-8"))
+        assert resp1["result"]["serverInfo"]["name"] == SERVER_NAME
+        rest_out = raw_out[nl_idx + 1 :]
+        assert rest_out.startswith(b"Content-Length: ")
+        hdr_end = rest_out.index(b"\r\n\r\n")
+        cl_len = int(rest_out[:hdr_end].decode("ascii").split(":", 1)[1].strip())
+        resp2 = json.loads(rest_out[hdr_end + 4 : hdr_end + 4 + cl_len].decode("utf-8"))
+        assert len(resp2["result"]["tools"]) == 24
+        assert len(READ_ONLY_TOOLS) == 9
+
+        parsed_alias = parse_args(["--http-url", "http://127.0.0.1:18080", "--http-listen-port", "8765"])
+        assert parsed_alias.arena_url == "http://127.0.0.1:18080" and parsed_alias.http_listen_port == 8765
+        assert resolve_arena_base_url("", testnet=False, network="", env={}) == "http://127.0.0.1:8080"
+        assert resolve_arena_base_url("", testnet=True, network="", env={"ARENA_URL": "http://127.0.0.1:9999"}) == "https://testnet.feraterra.app"
+        assert resolve_arena_base_url("", testnet=False, network="", env={"ARENA_NETWORK": "testnet"}) == "https://testnet.feraterra.app"
+        assert parse_args(["--testnet"]).arena_url == "https://testnet.feraterra.app"
+
+        # Verify real ArenaHttpClient.get_leaderboard signature compatibility on restricted gateway
+        real_lb_gw = ArenaMcpGateway(allowed_accounts=frozenset({2}), read_only=True)
+        try:
+            real_lb_gw.adapter.http._get = lambda path, params=None: {  # type: ignore[method-assign]
+                "ok": True,
+                "path": path,
+                "sort": (params or {}).get("sort"),
+                "limit": (params or {}).get("limit"),
+                "entries": [{"rank": 1, "account_id": 7, "wallet_masked": "0xabcd...1234"}],
+            }
+            real_lb_res = real_lb_gw.call_tool("arena_get_leaderboard", {"limit": 10, "sort": "streak"})
+            assert not real_lb_res["isError"], real_lb_res
+            real_lb_obj = json.loads(real_lb_res["content"][0]["text"])
+            assert real_lb_obj["path"] == "/leaderboard" and real_lb_obj["sort"] == "streak" and real_lb_obj["limit"] == 10
+        finally:
+            real_lb_gw.close()
+
+        lb_ok = gw.call_tool("arena_get_leaderboard", {"limit": 5, "sort": "pnl"})
+        assert not lb_ok["isError"], lb_ok
+        lb_payload = json.loads(lb_ok["content"][0]["text"])
+        assert lb_payload["ok"] is True and lb_payload["sort"] == "pnl" and lb_payload["entries"][0]["rank"] == 1
+
+        # Check allowlist, drawdown gate, auto-builder, notional cap, reduce_only exemption, withdrawal block
+        unauth = gw.call_tool("arena_get_account_portfolio", {"account_id": 99})
+        assert unauth["isError"] and "account_not_in_allowed_accounts" in unauth["content"][0]["text"]
+
+        no_dd = gw.call_tool("arena_place_order", {"symbol": "BTC/USD:USD", "side": "buy", "price_usd": "50000", "amount_base": "0.1"})
+        assert no_dd["isError"] and "drawdown_stop_required_before_trading" in no_dd["content"][0]["text"]
+
+        ep_no_dd = gw.call_tool("arena_subscribe_express_port", {"duration_epochs": 1})
+        assert ep_no_dd["isError"] and "drawdown_stop_required_before_trading" in ep_no_dd["content"][0]["text"]
+
+        stub.dd_micro = usd_to_micro("1000")
+        over_cap = gw.call_tool("arena_place_order", {"symbol": "BTC/USD:USD", "side": "buy", "price_usd": "60000", "amount_base": "1"})
+        assert over_cap["isError"] and "max_order_notional_exceeded" in over_cap["content"][0]["text"]
+
+        over_mkt = gw.call_tool("arena_place_order", {"symbol": "BTC/USD:USD", "side": "buy", "is_market": True, "amount_base": "1"})
+        assert over_mkt["isError"] and "max_order_notional_exceeded" in over_mkt["content"][0]["text"]
+
+        ok_ord = gw.call_tool("arena_place_order", {"symbol": "BTC/USD:USD", "side": "buy", "price_usd": "50000", "amount_base": "0.1", "priority_fee_ppm": 2500})
+        assert not ok_ord["isError"], ok_ord
+        assert stub.orders[-1]["priority_fee_ppm"] == 2500
+        assert stub.bound == [(2, 9, 1000)]
+
+        bad_prio = gw.call_tool("arena_place_order", {"symbol": "BTC/USD:USD", "side": "buy", "price_usd": "50000", "amount_base": "0.1", "priority_fee_ppm": 50001})
+        assert bad_prio["isError"]
+
+        bad_bid_hi = gw.call_tool("arena_execute_atomic_basket", {"legs": [{"symbol": "BTC/USD:USD", "side": "buy", "price_usd": "50000", "amount_base": "0.01"}, {"symbol": "BTC/USD", "side": "sell", "price_usd": "50100", "amount_base": "0.01"}], "express_surplus_bid_bps": 5001})
+        assert bad_bid_hi["isError"] and "express_surplus_bid_bps" in bad_bid_hi["content"][0]["text"]
+        bad_bid_lo = gw.call_tool("arena_execute_atomic_basket", {"legs": [{"symbol": "BTC/USD:USD", "side": "buy", "price_usd": "50000", "amount_base": "0.01"}, {"symbol": "BTC/USD", "side": "sell", "price_usd": "50100", "amount_base": "0.01"}], "express_surplus_bid_bps": -1})
+        assert bad_bid_lo["isError"] and "express_surplus_bid_bps" in bad_bid_lo["content"][0]["text"]
+
+        ro_ok = gw.call_tool("arena_place_order", {"symbol": "BTC/USD:USD", "side": "sell", "price_usd": "60000", "amount_base": "1", "reduce_only": True})
+        assert not ro_ok["isError"], ro_ok
+
+        cancel_ok = gw.call_tool("arena_cancel_orders", {"cancel_all": True})
+        assert not cancel_ok["isError"], cancel_ok
+
+        w_blocked = gw.call_tool("arena_request_withdrawal", {"amount_usd": "10", "recipient_eth_address": "0x" + ("11" * 20)})
+        assert w_blocked["isError"] and "withdrawals_disabled" in w_blocked["content"][0]["text"]
+
+        ep_ok = gw.call_tool("arena_subscribe_express_port", {"duration_epochs": 4})
+        assert not ep_ok["isError"], ep_ok
+        ep_payload = json.loads(ep_ok["content"][0]["text"])
+        assert ep_payload["epochs_purchased"] == 4 and ep_payload["fee_paid_usd_micro"] == 1_000_000
+
+        ep_over_cap = gw.call_tool("arena_subscribe_express_port", {"duration_epochs": 120_000})
+        assert ep_over_cap["isError"] and "max_order_notional_exceeded" in ep_over_cap["content"][0]["text"]
+
+        ep_bad = gw.call_tool("arena_subscribe_express_port", {"duration_epochs": 0})
+        assert ep_bad["isError"] and "duration_epochs" in ep_bad["content"][0]["text"]
+
+        # Read-only gateway check
+        ro_gw = ArenaMcpGateway(read_only=True)
+        assert {t["name"] for t in ro_gw.list_tools()} == READ_ONLY_TOOLS
+        ro_mut = ro_gw.call_tool("arena_place_order", {"market_id": 1, "side": "buy", "price_ticks": 100, "qty_lots": 1})
+        assert ro_mut["isError"] and "read_only_mode_enabled" in ro_mut["content"][0]["text"]
+        ro_gw.close()
+
+        # Withdrawal allowlist check
+        gw.allow_withdrawals = True
+        gw.allowed_withdrawal_recipients = frozenset({"0x" + ("aa" * 20)})
+        bad_recip = gw.call_tool("arena_request_withdrawal", {"amount_usd": "10", "recipient_eth_address": "0x" + ("bb" * 20)})
+        assert bad_recip["isError"] and "withdrawal_recipient_not_allowed" in bad_recip["content"][0]["text"]
+
+        # Secret scrubbing check (dict + error text redaction)
+        scrubbed = _scrub_secrets({"api_secret": "s3cr3t", "wire_key_lo64": 123, "nested": {"wallet_privkey": "0x99", "ok": True}})
+        assert scrubbed["api_secret"] == "[REDACTED]" and scrubbed["wire_key_lo64"] == "[REDACTED]"
+        assert scrubbed["nested"]["wallet_privkey"] == "[REDACTED]" and scrubbed["nested"]["ok"] is True
+
+        # Batch 3.1 MCP risk/cap/framing/redaction hardening checks
+        stub.dd_micro = 0
+        hedge_no_dd = gw.call_tool("arena_portfolio_delta_hedge", {"max_qty_lots": 100})
+        assert hedge_no_dd["isError"] and "drawdown_stop_required_before_trading" in hedge_no_dd["content"][0]["text"]
+
+        stub.dd_micro = usd_to_micro("1000")
+        sprd_no_ref = gw.call_tool("arena_place_order", {"symbol": "BTC-ETH-SPRD", "side": "buy", "amount_base": "1"})
+        assert sprd_no_ref["isError"] and "max_order_notional_exceeded" in sprd_no_ref["content"][0]["text"]
+
+        lowball_ask = gw.call_tool("arena_place_order", {"symbol": "BTC/USD:USD", "side": "sell", "price_usd": "1", "amount_base": "1"})
+        assert lowball_ask["isError"] and "max_order_notional_exceeded" in lowball_ask["content"][0]["text"]
+
+        q_over = gw.call_tool(
+            "arena_replace_two_sided_quote",
+            {"symbol": "BTC/USD:USD", "bid_price_usd": "50000", "bid_amount_base": "0.3", "ask_price_usd": "65000", "ask_amount_base": "0.3"},
+        )
+        assert q_over["isError"] and "max_order_notional_exceeded" in q_over["content"][0]["text"]
+        q_ok = gw.call_tool(
+            "arena_replace_two_sided_quote",
+            {"symbol": "BTC/USD:USD", "bid_price_usd": "50000", "bid_amount_base": "0.2", "ask_price_usd": "65000", "ask_amount_base": "0.1"},
+        )
+        assert not q_ok["isError"], q_ok
+
+        b_over = gw.call_tool(
+            "arena_execute_atomic_basket",
+            {
+                "legs": [
+                    {"symbol": "BTC/USD:USD", "side": "buy", "price_usd": "50000", "amount_base": "0.3"},
+                    {"symbol": "BTC/USD:USD", "side": "sell", "price_usd": "65000", "amount_base": "0.3"},
+                ]
+            },
+        )
+        assert b_over["isError"] and "max_order_notional_exceeded" in b_over["content"][0]["text"]
+
+        # Modify preserves actual ask side and rejects non-reduce_only shrinking crossing bypass
+        stub.open_orders = [
+            {"order_id": 501, "market_id": 1, "side": "ask", "price_ticks": 6_500_000, "remaining_lots": 5_000, "reduce_only": False},
+        ]
+        mod_missing = gw.call_tool("arena_modify_order", {"symbol": "BTC/USD:USD", "order_id": 999, "price_usd": "60000", "amount_base": "0.1"})
+        assert mod_missing["isError"] and "not found" in mod_missing["content"][0]["text"]
+        mod_bypass = gw.call_tool("arena_modify_order", {"symbol": "BTC/USD:USD", "order_id": 501, "price_usd": "10", "amount_base": "0.5"})
+        assert mod_bypass["isError"] and "max_order_notional_exceeded" in mod_bypass["content"][0]["text"]
+        mod_ok = gw.call_tool("arena_modify_order", {"symbol": "BTC/USD:USD", "order_id": 501, "price_usd": "61000", "amount_base": "0.2"})
+        assert not mod_ok["isError"], mod_ok
+        assert len(stub.edits) == 1 and stub.edits[0]["order_id"] == 501
+
+        # Delta hedge notional caps (bounded max_qty_lots and unbounded perp_positions)
+        hedge_bnd_over = gw.call_tool("arena_portfolio_delta_hedge", {"preferred_market_id": 1, "max_qty_lots": 10_000})
+        assert hedge_bnd_over["isError"] and "max_order_notional_exceeded" in hedge_bnd_over["content"][0]["text"]
+        stub.perp_positions = [{"market_id": 1, "position_lots": 10_000}]
+        hedge_unbnd_over = gw.call_tool("arena_portfolio_delta_hedge", {})
+        assert hedge_unbnd_over["isError"] and "max_order_notional_exceeded" in hedge_unbnd_over["content"][0]["text"]
+        stub.perp_positions = [{"market_id": 1, "position_lots": 1_000}]
+        hedge_ok = gw.call_tool("arena_portfolio_delta_hedge", {"preferred_market_id": 1, "max_qty_lots": 1_000})
+        assert not hedge_ok["isError"], hedge_ok
+
+        # Live exception secret redaction
+        stub.api_secret = "super_live_secret_token_999"
+        orig_health = stub.health
+        stub.health = lambda: (_ for _ in ()).throw(RuntimeError("boom api_secret=super_live_secret_token_999"))  # type: ignore[method-assign]
+        try:
+            leak_err = gw.call_tool("arena_health_and_manifest", {})
+            assert leak_err["isError"] and "super_live_secret_token_999" not in leak_err["content"][0]["text"]
+            assert "[REDACTED]" in leak_err["content"][0]["text"]
+        finally:
+            stub.health = orig_health  # type: ignore[method-assign]
+
+        # Batch 4A MCP regressions (M-1..M-6)
+        # M-1 & M-2: base_balances read accurately; cheap preferred_market_id with base_asset_id=0 cannot skip BTC holdings
+        stub.perp_positions = []
+        stub.base_balances = [
+            {"asset_id": 1, "symbol": "BTC", "free_lots": 10_000, "locked_lots": 0, "borrowed_lots": 0}
+        ]
+        m1_over = gw.call_tool("arena_portfolio_delta_hedge", {"base_asset_id": 0})
+        assert m1_over["isError"] and "max_order_notional_exceeded" in m1_over["content"][0]["text"], m1_over
+        m2_cheap_pref = gw.call_tool(
+            "arena_portfolio_delta_hedge",
+            {"base_asset_id": 0, "preferred_market_id": 2, "max_qty_lots": 10_000},
+        )
+        assert m2_cheap_pref["isError"] and "max_order_notional_exceeded" in m2_cheap_pref["content"][0]["text"], m2_cheap_pref
+        stub.base_balances = []
+
+        # M-3: jit_elastic_mult multiplies notional cap (place_order & quote_replace)
+        m3_ord = gw.call_tool(
+            "arena_place_order",
+            {"symbol": "BTC/USD:USD", "side": "buy", "price_usd": "50000", "amount_base": "0.02", "jit_elastic_mult": 50},
+        )
+        assert m3_ord["isError"] and "max_order_notional_exceeded" in m3_ord["content"][0]["text"], m3_ord
+        m3_qt = gw.call_tool(
+            "arena_replace_two_sided_quote",
+            {"symbol": "BTC/USD:USD", "bid_price_usd": "50000", "bid_amount_base": "0.02", "ask_price_usd": "65000", "ask_amount_base": "0", "jit_elastic_mult": 50},
+        )
+        assert m3_qt["isError"] and "max_order_notional_exceeded" in m3_qt["content"][0]["text"], m3_qt
+
+        # M-4: SpreadBook priced via gross underlying leg notional ($63k * 0.5 = $31.5k > $25k), not par offset ($10k * 0.5 = $5k)
+        m4_sprd = gw.call_tool(
+            "arena_place_order",
+            {"symbol": "BTC-BASIS-SPRD", "side": "buy", "price_usd": "10000", "amount_base": "0.5"},
+        )
+        assert m4_sprd["isError"] and "max_order_notional_exceeded" in m4_sprd["content"][0]["text"], m4_sprd
+
+        # M-5: --require-drawdown-stop blocks disarming, sub-$1 dust stops, and lowering active floor
+        m5_zero = gw.call_tool("arena_configure_risk_guardrails", {"drawdown_stop_usd": "0"})
+        assert m5_zero["isError"] and "drawdown_stop_cannot_be_disabled" in m5_zero["content"][0]["text"], m5_zero
+        m5_dust = gw.call_tool("arena_configure_risk_guardrails", {"drawdown_stop_usd_micro": 1})
+        assert m5_dust["isError"] and "drawdown_stop_below_minimum" in m5_dust["content"][0]["text"], m5_dust
+        m5_lower = gw.call_tool("arena_configure_risk_guardrails", {"drawdown_stop_usd": "500"})
+        assert m5_lower["isError"] and "drawdown_stop_cannot_be_lowered" in m5_lower["content"][0]["text"], m5_lower
+        m5_raise = gw.call_tool("arena_configure_risk_guardrails", {"drawdown_stop_usd": "2000"})
+        assert not m5_raise["isError"], m5_raise
+
+        # M-6: wire_key_lo64/hi64 scrubbed in text & serve_stdio ValueError framing responses
+        gw.adapter._wire_key_lo64 = 0x123456789ABCDEF0
+        gw.adapter._wire_key_hi64 = 987654321012345
+        wire_scrub = gw._scrub_secret_text("bad wire key 0x123456789abcdef0 and 987654321012345")
+        assert "123456789abcdef0" not in wire_scrub.lower() and "987654321012345" not in wire_scrub, wire_scrub
+        bad_cl_stream = io.BytesIO(b"Content-Length: 987654321012345_oops\r\n\r\n")
+        bad_cl_out = io.BytesIO()
+        assert gw.serve_stdio(bad_cl_stream, bad_cl_out) == 0
+        bad_cl_raw = bad_cl_out.getvalue().decode("utf-8")
+        assert "987654321012345" not in bad_cl_raw and "[REDACTED]" in bad_cl_raw, bad_cl_raw
+
+        # Dynamic market reload regression when markets_by_id is already populated (reload=True)
+        orig_stub_mkts = getattr(stub, "markets", None)
+        orig_stub_book = stub.book
+        orig_max_not = gw.max_order_notional_micro
+        dyn_mkts: List[Dict[str, Any]] = [
+            {
+                "market_id": 25,
+                "symbol": "NEW-USD-PERP",
+                "kind": "linear_perpetual",
+                "base_asset_id": 9,
+                "mark_price_ticks": 500_000,
+                "best_bid_ticks": 500_000,
+                "best_ask_ticks": 500_100,
+            }
+        ]
+        try:
+            stub.markets = lambda: {  # type: ignore[attr-defined]
+                "ok": True,
+                "markets": [
+                    {"market_id": 1, "symbol": "BTC-USD-PERP", "kind": "linear_perpetual", "base_asset_id": 1, "mark_price_ticks": 6_300_000},
+                    {"market_id": 2, "symbol": "ETH-USD-PERP", "kind": "linear_perpetual", "base_asset_id": 2, "mark_price_ticks": 300_000},
+                ]
+                + list(dyn_mkts),
+            }
+            stub.book = lambda mid, depth=25: (  # type: ignore[method-assign]
+                {"bids": [{"price_ticks": 500_000, "qty_lots": 100}], "asks": [{"price_ticks": 500_100, "qty_lots": 100}]}
+                if int(mid) in (25, 26)
+                else orig_stub_book(mid, depth=depth)
+            )
+            gw.max_order_notional_micro = usd_to_micro("2000")
+            stub.base_balances = [{"asset_id": 9, "symbol": "NEW", "free_lots": 10_000, "locked_lots": 0, "borrowed_lots": 0}]
+            dyn_reload_block = gw.call_tool("arena_portfolio_delta_hedge", {"base_asset_id": 9})
+            assert dyn_reload_block["isError"] and "max_order_notional_exceeded" in dyn_reload_block["content"][0]["text"], dyn_reload_block
+            assert 25 in gw.adapter.markets_by_id, gw.adapter.markets_by_id
+            dyn_mkts.append(
+                {
+                    "market_id": 26,
+                    "symbol": "NEW2-USD-PERP",
+                    "kind": "linear_perpetual",
+                    "base_asset_id": 10,
+                    "mark_price_ticks": 500_000,
+                    "best_bid_ticks": 500_000,
+                    "best_ask_ticks": 500_100,
+                }
+            )
+            stub.base_balances = []
+            pref_reload_ok = gw.call_tool(
+                "arena_portfolio_delta_hedge",
+                {"base_asset_id": 10, "preferred_market_id": 26, "max_qty_lots": 20},
+            )
+            assert not pref_reload_ok["isError"], pref_reload_ok
+            assert 26 in gw.adapter.markets_by_id, gw.adapter.markets_by_id
+        finally:
+            gw.max_order_notional_micro = orig_max_not
+            stub.base_balances = []
+            stub.book = orig_stub_book  # type: ignore[method-assign]
+            if orig_stub_mkts is None and hasattr(stub, "markets"):
+                delattr(stub, "markets")
+            elif orig_stub_mkts is not None:
+                stub.markets = orig_stub_mkts  # type: ignore[method-assign]
+
+        # Audit Tier 3 #3.1..#3.5 MCP regressions:
+        # #3.1: Thin stub bid (100 ticks) cannot understate mark_price_ticks (7,000,000 = $70k)
+        orig_book_31 = stub.book
+        try:
+            stub.book = lambda mid, depth=1: (  # type: ignore[method-assign]
+                {
+                    "ok": True,
+                    "market_id": int(mid),
+                    "best_bid_ticks": 100,
+                    "best_ask_ticks": 100,
+                    "mark_price_ticks": 7_000_000,
+                }
+            )
+            pegged_ask_bypass = gw.call_tool(
+                "arena_place_order",
+                {"symbol": "BTC/USD:USD", "side": "sell", "mark_peg": True, "price_ticks": 1, "qty_lots": 100_000},
+            )
+            assert (
+                pegged_ask_bypass["isError"]
+                and "max_order_notional_exceeded" in pegged_ask_bypass["content"][0]["text"]
+            ), pegged_ask_bypass
+        finally:
+            stub.book = orig_book_31  # type: ignore[method-assign]
+
+        # #3.2: arena_modify_order preserves peg_mode>0 & dark_hidden=True against mark_price_ticks
+        stub.open_orders = [
+            {
+                "order_id": 801,
+                "market_id": 1,
+                "side": "bid",
+                "price_ticks": 6_000_000,
+                "remaining_lots": 100,
+                "reduce_only": False,
+                "peg_mode": 3,
+                "dark_hidden": False,
+            }
+        ]
+        pegged_mod_bypass = gw.call_tool(
+            "arena_modify_order",
+            {"symbol": "BTC/USD:USD", "order_id": 801, "price_ticks": 1, "qty_lots": 10_000},
+        )
+        assert (
+            pegged_mod_bypass["isError"]
+            and "max_order_notional_exceeded" in pegged_mod_bypass["content"][0]["text"]
+        ), pegged_mod_bypass
+        stub.open_orders = []
+
+        # #3.3: action="link" requires drawdown stop & bounded guaranty, and binds no builder when rejected
+        stub.dd_micro = 0
+        link_no_dd = gw.call_tool(
+            "arena_manage_prime_subaccount",
+            {"action": "link", "master_account_id": 2, "sub_account_id": 3, "max_guaranty_usd": "1000"},
+        )
+        assert (
+            link_no_dd["isError"]
+            and "drawdown_stop_required_before_trading" in link_no_dd["content"][0]["text"]
+        ), link_no_dd
+        stub.dd_micro = usd_to_micro("1000")
+        prev_bound_len = len(stub.bound)
+        link_unlim = gw.call_tool(
+            "arena_manage_prime_subaccount",
+            {"action": "link", "master_account_id": 2, "sub_account_id": 3},
+        )
+        assert (
+            link_unlim["isError"]
+            and "max_order_notional_exceeded" in link_unlim["content"][0]["text"]
+            and len(stub.bound) == prev_bound_len
+        ), link_unlim
+
+        # #3.4: static creds block wallet login without allow_wallet_login=True + restore creds metadata on failure
+        static_gw = ArenaMcpGateway(
+            account_id=2,
+            api_key="static_k",
+            api_secret="static_secret_tok_xyz",
+            allowed_accounts=frozenset({2}),
+            allow_wallet_login=False,
+        )
+        static_gw.adapter.http.close()
+        try:
+            blocked_wl = static_gw.call_tool("arena_login_wallet", {"generate_ephemeral": True})
+            assert blocked_wl["isError"] and "wallet_login_disabled" in blocked_wl["content"][0]["text"], blocked_wl
+        finally:
+            static_gw.close()
+
+        class _CredsStubHttp(_StubHttp):
+            def __init__(self) -> None:
+                super().__init__()
+                self.api_key = "k_orig_abc123"
+                self.api_secret = "s_orig_secret_789"
+                self._creds_path = "/tmp/fake_creds.json"
+                self._creds_role = "trader"
+                self._creds_fallback_role = "operator"
+                self._creds_mtime_ns = 123456
+
+            def set_credentials(self, k: str, s: str) -> None:
+                self.api_key = k
+                self.api_secret = s
+                self._creds_path = None
+                self._creds_mtime_ns = None
+
+            def login_with_wallet(self, signer: Any) -> Dict[str, Any]:
+                _ = signer
+                self.set_credentials("ephemeral_k", "ephemeral_s")
+                return {"ok": True, "account_id": 999}
+
+        rb_gw = ArenaMcpGateway(account_id=2, api_key="k_orig_abc123", api_secret="s_orig_secret_789", allowed_accounts=frozenset({2}), allow_wallet_login=True)
+        rb_stub = _CredsStubHttp()
+        rb_gw.adapter.http.close()
+        rb_gw.adapter.http = rb_stub  # type: ignore[assignment]
+        try:
+            rb_res = rb_gw.call_tool("arena_login_wallet", {"generate_ephemeral": True})
+            assert rb_res["isError"] and "account_not_in_allowed_accounts" in rb_res["content"][0]["text"], rb_res
+            assert rb_stub._creds_path == "/tmp/fake_creds.json" and rb_stub._creds_mtime_ns == 123456, rb_stub.__dict__
+            assert rb_stub.api_secret == "s_orig_secret_789"
+        finally:
+            rb_gw.close()
+
+        # #3.5: _err_tool_result scrubs bare secret tokens & _scrub_secrets handles tuples; short hex <=5 chars ignored
+        err_tok = gw._err_tool_result("unhandled failure with token super_live_secret_token_999 inside")
+        assert err_tok["isError"] and "super_live_secret_token_999" not in err_tok["content"][0]["text"], err_tok
+        assert "[REDACTED]" in err_tok["content"][0]["text"], err_tok
+        tup_scrub = _scrub_secrets(({"api_secret": "s_tup"}, ("ok", {"wallet_privkey": "0xab"})))
+        assert isinstance(tup_scrub, tuple) and tup_scrub[0]["api_secret"] == "[REDACTED]"
+        assert tup_scrub[1][1]["wallet_privkey"] == "[REDACTED]"
+        prev_lo = gw.adapter._wire_key_lo64
+        try:
+            gw.adapter._wire_key_lo64 = 1
+            assert gw._scrub_secret_text("addr=0x12345") == "addr=0x12345"
+        finally:
+            gw.adapter._wire_key_lo64 = prev_lo
+
+        # Gladiator Launchpad: preview_order, flash_arbitrage, auto_liquidate, ephemeral key retention & Streamable HTTP
+        stub.dd_micro = usd_to_micro("1000")
+        prev_ok = gw.call_tool("arena_preview_order", {"symbol": "BTC/USD:USD", "side": "buy", "price_usd": "50000", "amount_base": "0.1"})
+        assert not prev_ok["isError"], prev_ok
+        prev_data = json.loads(prev_ok["content"][0]["text"])
+        assert prev_data["preview"] is True and prev_data["wouldAccept"] is True
+
+        fa_ok = gw.call_tool("arena_flash_arbitrage", {"symbol": "BTC/USD:USD", "side": "buy", "amount_base": "0.05", "min_profit_usd": "0.01"})
+        assert not fa_ok["isError"], fa_ok
+        fa_lowball_bypass = gw.call_tool(
+            "arena_flash_arbitrage",
+            {"symbol": "BTC/USD:USD", "side": "mint", "limit_price_usd": "1.00", "amount_base": "1.0"},
+        )
+        assert fa_lowball_bypass["isError"] and "max_order_notional_exceeded" in fa_lowball_bypass["content"][0]["text"], fa_lowball_bypass
+
+        liq_unbounded_cap = gw.call_tool("arena_auto_liquidate", {"market_id": 1, "flash_offload_to_book": True})
+        assert liq_unbounded_cap["isError"] and "max_order_notional_exceeded" in liq_unbounded_cap["content"][0]["text"], liq_unbounded_cap
+        liq_ok = gw.call_tool("arena_auto_liquidate", {"market_id": 1, "max_lots": 100, "flash_offload_to_book": True})
+        assert not liq_ok["isError"], liq_ok
+        stub.dd_micro = 0
+        liq_no_dd = gw.call_tool("arena_auto_liquidate", {"market_id": 1, "max_lots": 100, "flash_offload_to_book": True})
+        assert liq_no_dd["isError"] and "drawdown_stop_required_before_trading" in liq_no_dd["content"][0]["text"], liq_no_dd
+        stub.dd_micro = usd_to_micro("1000")
+
+        # Verify use_binary_wire=True gracefully falls back to HTTP REST when tcp_port == 0
+        bin_fallback_ok = gw.call_tool(
+            "arena_place_order",
+            {"symbol": "BTC/USD:USD", "side": "buy", "price_usd": "50000", "amount_base": "0.05", "use_binary_wire": True},
+        )
+        assert not bin_fallback_ok["isError"], bin_fallback_ok
+
+        # Verify rpc_url SSRF block on arena_onboard_and_deposit (http loopback, metadata, CGNAT, shorthand IPs)
+        for bad_rpc in (
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:8545",
+            "http://localhost:8545",
+            "https://100.64.0.1/rpc",
+            "https://127.1/rpc",
+        ):
+            ssrf_block = gw.call_tool(
+                "arena_onboard_and_deposit",
+                {"request_faucet": False, "deposit_onchain": True, "rpc_url": bad_rpc},
+            )
+            assert ssrf_block["isError"] and "unsafe_rpc_url" in ssrf_block["content"][0]["text"], (bad_rpc, ssrf_block)
+
+        onb_ok = gw.call_tool("arena_onboard_and_deposit", {"generate_ephemeral": True, "request_faucet": True, "faucet_amount": "5000", "deposit_onchain": False})
+        assert not onb_ok["isError"], onb_ok
+        assert gw._wallet_privkey_hex.startswith("0x") and len(gw._wallet_privkey_hex) == 66
+        assert gw._wallet_privkey_hex not in onb_ok["content"][0]["text"]
+
+        import urllib.error
+        import urllib.request
+
+        http_srv = gw.create_http_server(host="127.0.0.1", port=0, bearer_token="gladiator-secret")
+        http_port = int(http_srv.server_address[1])
+        http_thr = threading.Thread(target=http_srv.serve_forever, daemon=True)
+        http_thr.start()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{http_port}/mcp/health", timeout=3.0) as hresp:
+                hj = json.loads(hresp.read().decode("utf-8"))
+                assert hj["ok"] is True and hj["tool_count"] == 24
+
+            got_405 = False
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{http_port}/mcp", timeout=3.0)
+            except urllib.error.HTTPError as he405:
+                got_405 = (he405.code == 405)
+            assert got_405, "Expected HTTP 405 on GET /mcp"
+
+            opt_req = urllib.request.Request(f"http://127.0.0.1:{http_port}/mcp", method="OPTIONS")
+            with urllib.request.urlopen(opt_req, timeout=3.0) as oresp:
+                assert oresp.status == 204
+
+            unauth_req = urllib.request.Request(
+                f"http://127.0.0.1:{http_port}/mcp",
+                data=b'{"jsonrpc":"2.0","id":1,"method":"ping"}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            got_401 = False
+            try:
+                urllib.request.urlopen(unauth_req, timeout=3.0)
+            except urllib.error.HTTPError as he:
+                got_401 = (he.code == 401)
+            assert got_401, "Expected HTTP 401 without Bearer token"
+
+            notif_req = urllib.request.Request(
+                f"http://127.0.0.1:{http_port}/mcp",
+                data=b'{"jsonrpc":"2.0","method":"notifications/initialized"}',
+                headers={"Content-Type": "application/json", "Authorization": "Bearer gladiator-secret"},
+                method="POST",
+            )
+            with urllib.request.urlopen(notif_req, timeout=3.0) as nresp:
+                assert nresp.status == 202
+
+            tl_req = urllib.request.Request(
+                f"http://127.0.0.1:{http_port}/mcp",
+                data=b'{"jsonrpc":"2.0","id":7,"method":"tools/list"}',
+                headers={"Content-Type": "application/json", "Authorization": "Bearer gladiator-secret"},
+                method="POST",
+            )
+            with urllib.request.urlopen(tl_req, timeout=3.0) as tresp:
+                tj = json.loads(tresp.read().decode("utf-8"))
+                assert len(tj["result"]["tools"]) == 24
+        finally:
+            http_srv.shutdown()
+            http_srv.server_close()
+    finally:
+        gw.close()
+
+    print("[PASS] arena_mcp_server.py v4.9 MCP gateway self-test OK")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    if args.self_test:
+        _run_mcp_self_test()
+        return 0
+
+    wallet_pk = str(args.wallet_privkey or "").strip()
+    if not wallet_pk and args.wallet_privkey_file:
+        wallet_pk = Path(args.wallet_privkey_file).read_text(encoding="utf-8").strip()
+
+    max_notional_micro = usd_to_micro(args.max_order_notional_usd, allow_zero=True)
+    min_dd_micro = usd_to_micro(args.min_drawdown_stop_usd, allow_zero=True)
+    allowed_accts = _parse_int_csv(args.allowed_accounts)
+    allowed_recips = _parse_addr_csv(args.allowed_withdrawal_recipients)
+
+    gw = ArenaMcpGateway(
+        arena_url=args.arena_url,
+        tcp_host=args.tcp_host,
+        tcp_port=args.tcp_port,
+        account_id=args.account_id,
+        api_key=args.api_key or None,
+        api_secret=args.api_secret or None,
+        creds_file=args.creds_file or None,
+        wallet_privkey_hex=wallet_pk or None,
+        rpc_url=args.rpc_url,
+        clearinghouse=args.clearinghouse,
+        expected_operator_address=args.expected_operator_address,
+        read_only=args.read_only,
+        allowed_accounts=allowed_accts,
+        max_order_notional_micro=max_notional_micro,
+        require_drawdown_stop=args.require_drawdown_stop,
+        min_drawdown_stop_micro=min_dd_micro,
+        default_builder_account=args.default_builder_account,
+        default_builder_bps=args.default_builder_bps,
+        allow_withdrawals=args.allow_withdrawals,
+        allowed_withdrawal_recipients=allowed_recips,
+        allow_wallet_login=args.allow_wallet_login,
+        timeout=args.timeout,
+    )
+    try:
+        if int(args.http_listen_port) > 0:
+            return gw.serve_http(
+                host=str(args.http_listen_host or "127.0.0.1"),
+                port=int(args.http_listen_port),
+                bearer_token=str(args.http_bearer_token or ""),
+            )
+        return gw.serve_stdio(sys.stdin.buffer, sys.stdout.buffer)
+    finally:
+        gw.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

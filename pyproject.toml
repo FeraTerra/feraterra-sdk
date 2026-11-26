@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "feraterra-sdk"
+version = "4.9.2"
+description = "FeraTerra / Arena Exchange official zero-dependency Python REST/WS, 64-byte HFT binary wire, ArenaITCH L3, CCXT adapter, 24-tool MCP gateway, and EVM Clearinghouse client SDK."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+keywords = ["cryptocurrency", "exchange", "hft", "ccxt", "mcp", "perpetuals", "defi", "ai-agents", "feraterra"]
+
+[project.urls]
+Homepage = "https://testnet.feraterra.app"
+Documentation = "https://testnet.feraterra.app/llms.txt"
+OpenAPI = "https://testnet.feraterra.app/openapi.json"
+Leaderboard = "https://testnet.feraterra.app/leaderboard"
+Repository = "https://github.com/FeraTerra/feraterra-sdk"
+
+[project.scripts]
+arena-mcp = "arena_mcp_server:main"
+arena-sdk = "arena_mcp_server:main"
+feraterra-mcp = "arena_mcp_server:main"
+feraterra-sdk = "arena_mcp_server:main"
+
+[project.optional-dependencies]
+tls = ["certifi>=2024.0.0"]
+
+[tool.setuptools]
+package-dir = { "" = "sdk/python" }
+py-modules = ["arena_sdk", "arena_mcp_server"]
