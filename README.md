@@ -1,20 +1,23 @@
 <!-- mcp-name: io.github.FeraTerra/feraterra-sdk -->
-# Arena Exchange — Official Headless Client SDK & MCP Gateway (`v4.9.2`)
+# Arena Exchange — Official Headless Client SDK & MCP Gateway (`v4.9.3`)
 
 [![FeraTerra/feraterra-sdk MCP server](https://glama.ai/mcp/servers/FeraTerra/feraterra-sdk/badges/score.svg)](https://glama.ai/mcp/servers/FeraTerra/feraterra-sdk)
 
-Zero-dependency client connectors and 24-tool MCP gateway for trading on **Arena Exchange** (`feraterra.app`) — a 100% headless computational venue with **0 bps maker fees** (maker rebates on segmented venues), cross-margined Spot/Perps/FormulaPerps/BoundedClaims/SpreadBooks, stateless `POST /order/preview` margin dry-runs, `$0`-capital atomic flash arbitrage & liquidation bounties, live Gladiator Leaderboard (`GET /leaderboard`), and non-custodial L2 `Clearinghouse` Merkle-escape solvency.
+Zero-dependency client connectors, LangChain/PydanticAI agent toolkits, and 24-tool MCP gateway for trading on **Arena Exchange** (`https://feraterra.app`) — a 100% headless computational venue with **0 bps maker fees** (maker rebates on segmented venues), cross-margined Spot/Perps/FormulaPerps/BoundedClaims/SpreadBooks, stateless `POST /order/preview` margin dry-runs, `$0`-capital atomic flash arbitrage & liquidation bounties, live Gladiator Leaderboard (`GET /leaderboard`), and non-custodial L2 `Clearinghouse` Merkle-escape solvency.
 
+- **Apex Network Directory:** `https://feraterra.app`
+- **Zero-Install Remote Streamable HTTP MCP:** `https://mcp.feraterra.app/mcp`
 - **Public Base Sepolia Testnet HTTPS:** `https://testnet.feraterra.app`
 - **Public Base Sepolia Testnet WebSocket:** `wss://testnet.feraterra.app/ws`
 - **AI Discovery & OpenAPI 3.1:** `https://testnet.feraterra.app/llms.txt` | `https://testnet.feraterra.app/openapi.json`
 - **Gladiator Leaderboard:** `https://testnet.feraterra.app/leaderboard`
 
-## Bundle Contents (14 Files)
+## Bundle Contents (20 Files)
 
 | Path | Purpose |
 | :--- | :--- |
 | `sdk/python/arena_sdk.py` | Pure Python 3 stdlib client (`ArenaHttpClient`, `ArenaWsClient`, `ArenaBinaryClient`, `ArenaItchClient`, `ArenaCcxtAdapter`, `EthWalletSigner`, `EvmJsonRpcClient`, `testnet()` presets, `get_leaderboard()` & Merkle/Ledger verifiers) |
+| `sdk/python/feraterra_sdk.py` | Canonical `import feraterra_sdk` namespace plus LangChain (`create_langchain_tools()`) and PydanticAI (`create_pydantic_ai_toolset()`) agent toolkits |
 | `sdk/python/arena_mcp_server.py` | Packaged 24-tool MCP gateway module exposing `feraterra-mcp`, `feraterra-sdk`, `arena-mcp`, and `arena-sdk` CLI entry points |
 | `include/arena_wire.hpp` | Canonical 64-byte `ArenaWireFrame` & `ArenaITCH` C++23 wire layout (`static_assert(sizeof == 64)`) |
 | `include/arena_hft_client.hpp` | Header-only C++23 HFT TCP/UDP/ITCH client (`namespace arena::sdk`, `PUBLIC_TESTNET_HTTPS_URL`) |
@@ -23,8 +26,13 @@ Zero-dependency client connectors and 24-tool MCP gateway for trading on **Arena
 | `examples/quickstart_ccxt_and_preview.py` | Client-side AI discovery (`GET /llms.txt`, `GET /openapi.json`), EIP-191 wallet login, CCXT `camelCase` & `POST /order/preview` dry-run |
 | `examples/algo_two_sided_quoter.py` | Client-side Market-Maker Protection (`MMP`) + inventory-skewed atomic two-sided quote replacement starter |
 | `examples/ai_agent_zero_capital_scanner.py` | Client-side zero-capital atomic flash-arbitrage (`POST /flash_arb`) & auto-liquidation bounty scanner |
-| `pyproject.toml` | Zero-dependency PEP 621 package manifest (`pip install feraterra-sdk` / `pip install .`) |
-| `server.json` | Official MCP Registry manifest (`io.github.FeraTerra/feraterra-sdk`) |
+| `pyproject.toml` | Zero-dependency PEP 621 package manifest (`pip install feraterra-sdk` + optional `langchain` & `pydantic-ai` extras) |
+| `server.json` | Official MCP Registry manifest (`io.github.FeraTerra/feraterra-sdk`) with `ARENA_NETWORK=testnet` default & Remote Streamable HTTP MCP |
+| `Dockerfile` | Minimal non-root `python:3.12-slim` container image (`ENTRYPOINT ["feraterra-mcp"]`) for Docker MCP Catalog & self-hosted deployments |
+| `SECURITY.md` | Responsible vulnerability disclosure policy & client guardrail notes |
+| `.github/dependabot.yml` | Weekly Dependabot security updates for GitHub Actions & Python packaging |
+| `.github/workflows/ci.yml` | Public GitHub Actions CI workflow (Python `3.12` SDK/MCP self-tests & `g++ -std=c++23 -fsyntax-only` header gate) |
+| `.github/workflows/publish-pypi.yml` | Tokenless OIDC Trusted Publisher GitHub Actions workflow (`pypa/gh-action-pypi-publish@release/v1`) |
 | `.gitignore` | Clean repository ignore rules for Python bytecode, venvs, and local key files |
 | `README.md` | Public trader, quant & AI-agent quickstart guide |
 | `LICENSE` | MIT license for public client connectors |
@@ -36,25 +44,35 @@ Zero-dependency client connectors and 24-tool MCP gateway for trading on **Arena
 ```bash
 pip install feraterra-sdk
 
+# Optional LangChain / PydanticAI agent framework extras:
+pip install "feraterra-sdk[langchain,pydantic-ai]"
+
 # Launch the 24-tool MCP gateway directly (via pip or uvx):
-arena-mcp --testnet
+feraterra-mcp --testnet
 # or:
 uvx feraterra-sdk --testnet
 ```
 
-For single-click MCP clients and the Official MCP Registry (`io.github.FeraTerra/feraterra-sdk`), a zero-dependency MCP Bundle (`arena-sdk.mcpb`) is also attached to every GitHub Release (`https://github.com/FeraTerra/feraterra-sdk/releases/download/v4.9.2/feraterra-sdk.mcpb`).
+For single-click MCP clients and the Official MCP Registry (`io.github.FeraTerra/feraterra-sdk`), a zero-dependency MCP Bundle (`feraterra-sdk.mcpb`) is also attached to every GitHub Release (`https://github.com/FeraTerra/feraterra-sdk/releases/download/v4.9.3/feraterra-sdk.mcpb`), or connect with **zero install** to the hosted Remote Streamable HTTP MCP endpoint at `https://mcp.feraterra.app/mcp`.
 
-Point any LLM, autonomous agent, or HTTP client at `https://testnet.feraterra.app` (or local `http://127.0.0.1:8088`):
+Point any LLM, autonomous agent, or HTTP client at `https://feraterra.app` (Apex Network Directory) or `https://testnet.feraterra.app` (or local `http://127.0.0.1:8088`):
 
 - `GET /llms.txt` — Concise machine-readable protocol specification, fixed-point scales (`1 tick = $0.01`, `1 lot = 1e-4` base, `1 micro = $1e-6`), EIP-191 auth flow, and zero-capital endpoints.
 - `GET /openapi.json` — Full OpenAPI `3.1.0` JSON schema for automatic tool/client generation.
 - `GET /leaderboard` — Live Gladiator Leaderboard ranking active wallets (masked `0x1234...abcd`) by equity, PnL, maker BBO streak, volume, or ROI.
 - `GET /faucet/status` — Base Sepolia (`chain_id=84532`) `Clearinghouse` contract address, collateral token address, and faucet limits.
 
-### 2. One-Line Public Testnet Onboarding, Faucet, L2 Deposit & CCXT Adapter
+### 2. One-Line Public Testnet Onboarding, Agent Toolkits (`import feraterra_sdk`) & CCXT Adapter
 
 ```python
-from arena_sdk import ArenaHttpClient, ArenaCcxtAdapter, EthWalletSigner
+import feraterra_sdk
+from feraterra_sdk import (
+    ArenaCcxtAdapter,
+    ArenaHttpClient,
+    EthWalletSigner,
+    create_langchain_tools,
+    create_pydantic_ai_toolset,
+)
 
 client = ArenaHttpClient.testnet()  # https://testnet.feraterra.app
 
@@ -63,9 +81,9 @@ signer = EthWalletSigner()
 login = client.login_with_wallet(signer)
 account_id = int(login["account_id"])
 
-# 2) Optional: mint Base Sepolia testnet USDC + L2 gas drip, then deposit on-chain
-# client.request_testnet_faucet(signer.address, amount="10000", asset="USD", drip_gas=True)
-# client.deposit_onchain_margin(signer, "10000", account_id=account_id, wait_for_credit=True)
+# 2) Optional: build LangChain StructuredTools or PydanticAI FunctionToolset (with [langchain,pydantic-ai] extras)
+# lc_tools = create_langchain_tools(client, account_id=account_id)
+# pai_toolset = create_pydantic_ai_toolset(client, account_id=account_id)
 
 # 3) Drop-in CCXT camelCase adapter + stateless pre-trade margin/fill simulation (zero WAL mutation)
 exchange = ArenaCcxtAdapter(client, account_id=account_id)
@@ -75,9 +93,22 @@ print("Preview    :", exchange.previewOrder("BTC/USD:USD", "limit", "buy", "0.01
 print("Leaderboard:", exchange.fetchLeaderboard(limit=5, sort="equity")[:3])
 ```
 
-### 3. Autonomous AI Agent 24-Tool MCP Server (`stdio` & Streamable HTTP)
+### 3. Autonomous AI Agent 24-Tool MCP Server (Remote Streamable HTTP & Local `stdio`)
 
-**Claude Desktop / Cursor / Windsurf (`mcpServers` JSON via `uvx` or `arena-mcp`):**
+**Zero-Install Hosted Remote Streamable HTTP MCP (`https://mcp.feraterra.app/mcp`):**
+
+```json
+{
+  "mcpServers": {
+    "feraterra-remote": {
+      "type": "streamable-http",
+      "url": "https://mcp.feraterra.app/mcp"
+    }
+  }
+}
+```
+
+**Local Claude Desktop / Cursor / Windsurf (`mcpServers` JSON via `uvx` or `feraterra-mcp`):**
 
 ```json
 {
@@ -85,7 +116,7 @@ print("Leaderboard:", exchange.fetchLeaderboard(limit=5, sort="equity")[:3])
     "arena-exchange": {
       "command": "uvx",
       "args": [
-        "arena-sdk",
+        "feraterra-sdk",
         "--testnet",
         "--max-order-notional-usd",
         "5000"
@@ -95,10 +126,10 @@ print("Leaderboard:", exchange.fetchLeaderboard(limit=5, sort="equity")[:3])
 }
 ```
 
-Inside the agent session, call `arena_onboard_and_deposit` (`generate_ephemeral=true`) to provision a wallet, mint testnet collateral + gas, and deposit margin in a single tool call, `arena_get_leaderboard` to check live Gladiator standings, or run Streamable HTTP mode for remote agents:
+Inside the agent session, call `arena_onboard_and_deposit` (`generate_ephemeral=true`) to provision a wallet, mint testnet collateral + gas, and deposit margin in a single tool call, `arena_get_leaderboard` to check live Gladiator standings, or self-host Streamable HTTP mode for private remote agents:
 
 ```bash
-arena-mcp --testnet --http-listen-port 8765 --http-bearer-token "$MCP_SECRET"
+feraterra-mcp --testnet --http-listen-port 8765 --http-bearer-token "$MCP_SECRET"
 ```
 
 ### 4. C++23 Header-Only 64-Byte HFT Wire & ArenaITCH Client
@@ -114,9 +145,10 @@ static_assert(sizeof(arena::wire::ArenaWireFrame) == 64);
 
 ```bash
 # Offline deterministic self-tests:
-python sdk/python/arena_sdk.py --self-test
-python scripts/arena_mcp_server.py --self-test
-python examples/quickstart_ccxt_and_preview.py --self-test
+python -B sdk/python/arena_sdk.py --self-test
+PYTHONPATH=sdk/python python -B sdk/python/feraterra_sdk.py --self-test
+python -B scripts/arena_mcp_server.py --self-test
+python -B examples/quickstart_ccxt_and_preview.py --self-test
 
 # Live dry-run & execution against the public Base Sepolia testnet:
 python examples/quickstart_ccxt_and_preview.py --testnet

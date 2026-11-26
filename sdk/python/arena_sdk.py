@@ -68,8 +68,10 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Deque, Dict, Iterator, List, Optional
+from typing import Any, Deque, Dict, Iterator, List, Optional, Sequence
 
+__version__ = "4.9.3"
+TICK_SIZE = 4
 ARENA_WIRE_BYTES = 64
 MASK50 = (1 << 50) - 1
 MASK64 = 0xFFFF_FFFF_FFFF_FFFF
@@ -11565,27 +11567,45 @@ def _wire_status_from_order_res(status_str: str, filled_lots: int, resting_lots:
     return norm or "open"
 
 
+def _client_order_id_to_tag62(client_order_id: str) -> int:
+    """Deterministically hash a non-empty string `clientOrderId` into a positive 62-bit `client_tag`."""
+    cleaned = str(client_order_id or "").strip()
+    if not cleaned:
+        return 0
+    digest_u64 = int.from_bytes(hashlib.sha256(cleaned.encode("utf-8")).digest()[:8], "big")
+    tag62 = digest_u64 & CANCEL_ALL_TAG_MASK
+    return tag62 if tag62 > 0 else 1
+
+
 class ArenaCcxtAdapter:
     """Zero-dependency CCXT-compatible synchronous exchange adapter over Arena Exchange REST & 64B TCP wire."""
 
     id = "arena"
     name = "Arena Exchange"
+    precisionMode: int = TICK_SIZE
     has: Dict[str, bool] = {
         "loadMarkets": True,
         "fetchMarkets": True,
         "fetchTicker": True,
         "fetchTickers": True,
         "fetchOrderBook": True,
+        "fetchL2OrderBook": True,
         "fetchTrades": True,
+        "fetchMyTrades": True,
         "fetchOHLCV": True,
+        "fetchFundingRate": True,
         "fetchBalance": True,
         "fetchPositions": True,
         "fetchOpenOrders": True,
         "createOrder": True,
+        "createLimitOrder": True,
+        "createMarketOrder": True,
         "previewOrder": True,
         "editOrder": True,
         "cancelOrder": True,
         "cancelAllOrders": True,
+        "setLeverage": True,
+        "setMarginMode": True,
         "withdraw": True,
         "loginWithWallet": True,
         "setSandboxMode": True,
@@ -11770,6 +11790,19 @@ class ArenaCcxtAdapter:
         self.markets_by_symbol: Dict[str, Dict[str, Any]] = {}
         self.markets_by_id: Dict[int, Dict[str, Any]] = {}
         self.unified_to_native: Dict[str, str] = {}
+        self.options: Dict[str, Any] = (
+            dict(base_url["options"])
+            if isinstance(base_url, dict) and isinstance(base_url.get("options"), dict)
+            else {}
+        )
+        self.precisionMode: int = TICK_SIZE
+        self.fees: Dict[str, Any] = {"trading": {"maker": 0.0, "taker": 0.0}}
+        self.currencies: Dict[str, Dict[str, Any]] = {}
+        self.features: Dict[str, Any] = {
+            "spot": {"fetchOHLCV": {"limit": 240}},
+            "swap": {"linear": {"fetchOHLCV": {"limit": 240}}},
+        }
+        self.has: Dict[str, bool] = dict(self.has)
 
         if wallet_privkey_hex:
             signer = EthWalletSigner(wallet_privkey_hex)
@@ -11959,7 +11992,9 @@ class ArenaCcxtAdapter:
             "swap": is_swap,
             "future": False,
             "contract": not is_spot,
+            "contractSize": 1.0 if not is_spot else None,
             "linear": True if not is_spot else None,
+            "inverse": False if not is_spot else None,
             "active": str(m.get("trading_status", "live")).lower() != "halted",
             "precision": {"amount": 0.0001, "price": 0.01},
             "limits": {
@@ -11968,13 +12003,20 @@ class ArenaCcxtAdapter:
                     "min": price_ticks_to_float(int(m.get("min_price_ticks", 1))),
                     "max": price_ticks_to_float(int(m.get("max_price_ticks", 1))),
                 },
+                "cost": {"min": None, "max": None},
+                "leverage": {"min": 1.0, "max": None},
             },
             "maker": int(m.get("maker_fee_bps", 0)) / 10000.0,
             "taker": int(m.get("taker_fee_bps", 0)) / 10000.0,
             "info": m,
         }
 
-    def load_markets(self, reload: bool = False) -> Dict[str, Dict[str, Any]]:
+    def load_markets(
+        self,
+        reload: bool = False,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        _ = params
         if self.markets_by_symbol and not reload:
             return {**self.markets, **self.markets_by_symbol}
         resp = self.http.markets()
@@ -12002,8 +12044,11 @@ class ArenaCcxtAdapter:
         self.unified_to_native = u2n
         return {**self.markets, **self.markets_by_symbol}
 
-    def fetch_markets(self) -> List[Dict[str, Any]]:
-        self.load_markets(reload=True)
+    def fetch_markets(
+        self,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        self.load_markets(reload=True, params=params)
         return [self.markets_by_id[mid] for mid in sorted(self.markets_by_id.keys())]
 
     def resolve_market(self, symbol_or_id: str | int) -> Dict[str, Any]:
@@ -12065,20 +12110,31 @@ class ArenaCcxtAdapter:
             "info": m,
         }
 
-    def fetch_ticker(self, symbol: str | int) -> Dict[str, Any]:
+    def fetch_ticker(
+        self,
+        symbol: str | int,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        _ = params
         m = self.resolve_market(symbol)
         resp = self.http.ticker(int(m["market_id"]))
         if not resp.get("ok") or "ticker" not in resp:
             raise RuntimeError(f"GET /ticker failed: {resp}")
         return self._format_ticker(resp["ticker"])
 
-    def fetch_tickers(self, symbols: Optional[List[str | int]] = None) -> Dict[str, Dict[str, Any]]:
+    def fetch_tickers(
+        self,
+        symbols: Optional[Sequence[str | int]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        _ = params
         resp = self.http.markets()
         if not resp.get("ok"):
             raise RuntimeError(f"GET /markets failed: {resp}")
         allowed_mids: Optional[set[int]] = None
         if symbols is not None:
-            allowed_mids = {int(self.resolve_market(s)["market_id"]) for s in symbols}
+            sym_seq: Sequence[str | int] = [symbols] if isinstance(symbols, (str, int)) else symbols
+            allowed_mids = {int(self.resolve_market(s)["market_id"]) for s in sym_seq}
         out: Dict[str, Dict[str, Any]] = {}
         for m in list(resp.get("markets", [])):
             if allowed_mids is not None and int(m["market_id"]) not in allowed_mids:
@@ -12087,9 +12143,18 @@ class ArenaCcxtAdapter:
             out[str(tk["symbol"])] = tk
         return out
 
-    def fetch_order_book(self, symbol: str | int, limit: int = 20) -> Dict[str, Any]:
+    def fetch_order_book(
+        self,
+        symbol: str | int,
+        limit: Optional[int] = 50,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        p = dict(params or {})
+        eff_limit = 50 if limit is None else int(limit)
+        if limit is None and p.get("depth") is not None:
+            eff_limit = int(p["depth"])
         m = self.resolve_market(symbol)
-        resp = self.http.book(int(m["market_id"]), depth=max(1, min(200, int(limit))))
+        resp = self.http.book(int(m["market_id"]), depth=max(1, min(200, eff_limit)))
         if not resp.get("ok"):
             raise RuntimeError(f"GET /book failed: {resp}")
         bids = [[price_ticks_to_float(lvl[0]), qty_lots_to_float(lvl[1])] for lvl in list(resp.get("bids", []))]
@@ -12104,23 +12169,55 @@ class ArenaCcxtAdapter:
             "info": resp,
         }
 
-    def fetch_trades(self, symbol: str | int, limit: int = 50) -> List[Dict[str, Any]]:
+    def fetch_l2_order_book(
+        self,
+        symbol: str | int,
+        limit: Optional[int] = 50,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return self.fetch_order_book(symbol, limit=limit, params=params)
+
+    @staticmethod
+    def _trade_matches_since(t: Dict[str, Any], since: int) -> bool:
+        ts_raw = t.get("timestamp", t.get("ts_ms"))
+        if ts_raw is not None:
+            return int(ts_raw) >= int(since)
+        if int(since) < 100_000_000_000 and t.get("wal_seq") is not None:
+            return int(t["wal_seq"]) >= int(since)
+        return True
+
+    def fetch_trades(
+        self,
+        symbol: str | int,
+        since: Optional[int] = None,
+        limit: Optional[int] = 100,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        _ = params
+        eff_limit = 100 if limit is None else int(limit)
         m = self.resolve_market(symbol)
-        resp = self.http.trades(int(m["market_id"]), limit=max(1, min(512, int(limit))))
+        req_limit = 512 if since is not None else max(1, min(512, eff_limit))
+        resp = self.http.trades(int(m["market_id"]), limit=req_limit)
         if not resp.get("ok"):
             raise RuntimeError(f"GET /trades failed: {resp}")
         unified = self._unified_symbol_for_market(m)
         out: List[Dict[str, Any]] = []
         for t in list(resp.get("trades", [])):
+            if since is not None and not self._trade_matches_since(t, int(since)):
+                continue
             side_raw = str(t.get("taker_side", "bid")).lower()
+            px_t = int(t["price_ticks"])
+            qty_l = int(t["qty_lots"])
             out.append(
                 {
                     "id": str(t.get("trade_id_str", t.get("trade_id", 0))),
                     "symbol": unified,
                     "side": "buy" if side_raw in ("bid", "buy") else "sell",
-                    "price": price_ticks_to_float(int(t["price_ticks"])),
-                    "amount": qty_lots_to_float(int(t["qty_lots"])),
-                    "cost": micro_to_float(int(t.get("notional_micro", 0))),
+                    "price": price_ticks_to_float(px_t),
+                    "amount": qty_lots_to_float(qty_l),
+                    "cost": micro_to_float(int(t.get("notional_micro", px_t * qty_l))),
+                    "timestamp": int(t["timestamp"]) if t.get("timestamp") is not None else None,
+                    "datetime": None,
                     "fee": {
                         "cost": micro_to_float(int(t.get("taker_fee_micro", 0))),
                         "currency": "USD",
@@ -12128,23 +12225,114 @@ class ArenaCcxtAdapter:
                     "info": t,
                 }
             )
+            if len(out) >= max(1, eff_limit):
+                break
+        return out
+
+    def fetch_my_trades(
+        self,
+        symbol: Optional[str | int] = None,
+        since: Optional[int] = None,
+        limit: Optional[int] = 100,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        p = dict(params or {})
+        aid = self._effective_account_id(p)
+        eff_limit = 100 if limit is None else int(limit)
+        eff_sym = symbol if symbol is not None else p.get("symbol", p.get("market_id"))
+        if eff_sym is not None:
+            markets_to_scan = [self.resolve_market(eff_sym)]
+        else:
+            if not self.markets_by_id:
+                self.load_markets(reload=False)
+            markets_to_scan = [
+                self.markets_by_id[mid]["info"] for mid in sorted(self.markets_by_id.keys())
+            ]
+        out: List[Dict[str, Any]] = []
+        for m in markets_to_scan:
+            mid = int(m["market_id"])
+            resp = self.http.trades(mid, limit=min(512, max(100, eff_limit * 4)))
+            if not resp.get("ok"):
+                raise RuntimeError(f"GET /trades failed: {resp}")
+            unified = self._unified_symbol_for_market(m)
+            for t in list(resp.get("trades", [])):
+                maker_aid = int(t.get("maker_account_id", 0))
+                taker_aid = int(t.get("taker_account_id", 0))
+                acct_aid = int(t.get("account_id", 0))
+                if aid not in (maker_aid, taker_aid, acct_aid):
+                    continue
+                if since is not None and not self._trade_matches_since(t, int(since)):
+                    continue
+                side_raw = str(t.get("taker_side", "bid")).lower()
+                taker_is_buy = side_raw in ("bid", "buy")
+                if taker_aid == aid or (acct_aid == aid and maker_aid != aid):
+                    role = "taker"
+                    my_side = "buy" if taker_is_buy else "sell"
+                    ord_raw = t.get("taker_order_id_str", t.get("taker_order_id", t.get("order_id")))
+                    fee_m = int(t.get("taker_fee_micro", t.get("fee_micro", 0)))
+                else:
+                    role = "maker"
+                    my_side = "sell" if taker_is_buy else "buy"
+                    ord_raw = t.get("maker_order_id_str", t.get("maker_order_id", t.get("order_id")))
+                    fee_m = int(t.get("maker_fee_micro", 0))
+                px_t = int(t["price_ticks"])
+                qty_l = int(t["qty_lots"])
+                out.append(
+                    {
+                        "id": str(t.get("trade_id_str", t.get("trade_id", 0))),
+                        "order": str(ord_raw) if ord_raw is not None and str(ord_raw) != "0" else None,
+                        "symbol": unified,
+                        "marketId": mid,
+                        "side": my_side,
+                        "takerOrMaker": role,
+                        "price": price_ticks_to_float(px_t),
+                        "amount": qty_lots_to_float(qty_l),
+                        "cost": micro_to_float(int(t.get("notional_micro", px_t * qty_l))),
+                        "timestamp": int(t["timestamp"]) if t.get("timestamp") is not None else None,
+                        "datetime": None,
+                        "fee": {
+                            "cost": micro_to_float(fee_m),
+                            "currency": "USD",
+                        },
+                        "walSeq": int(t.get("wal_seq", 0)),
+                        "info": t,
+                    }
+                )
+                if len(out) >= max(1, eff_limit):
+                    return out
         return out
 
     def fetch_ohlcv(
-        self, symbol: str | int, timeframe: str = "1m", limit: int = 120
+        self,
+        symbol: str | int,
+        timeframe: str = "1m",
+        since: Optional[int] = None,
+        limit: Optional[int] = 120,
+        params: Optional[Dict[str, Any]] = None,
     ) -> List[List[float | int]]:
+        _ = params
+        eff_limit = 120 if limit is None else int(limit)
         tf = str(timeframe or "1m").strip()
         if tf not in self.timeframes:
             raise ValueError(f"Unsupported timeframe {timeframe!r}; expected one of {tuple(self.timeframes)}")
         m = self.resolve_market(symbol)
-        resp = self.http.candles(int(m["market_id"]), interval=tf, limit=max(1, min(240, int(limit))))
+        req_limit = 240 if since is not None else max(1, min(240, eff_limit))
+        resp = self.http.candles(int(m["market_id"]), interval=tf, limit=req_limit)
         if not resp.get("ok"):
             raise RuntimeError(f"GET /candles failed: {resp}")
+        since_i = int(since) if since is not None else None
         out: List[List[float | int]] = []
         for bar in list(resp.get("candles", [])):
+            bar_ts = int(bar[0])
+            if since_i is not None:
+                if since_i >= 100_000_000_000 and 0 < bar_ts < 100_000_000_000 and tf != "tick":
+                    if bar_ts * 1000 < since_i:
+                        continue
+                elif bar_ts < since_i:
+                    continue
             out.append(
                 [
-                    int(bar[0]),
+                    bar_ts,
                     price_ticks_to_float(int(bar[1])),
                     price_ticks_to_float(int(bar[2])),
                     price_ticks_to_float(int(bar[3])),
@@ -12152,7 +12340,44 @@ class ArenaCcxtAdapter:
                     qty_lots_to_float(int(bar[5])),
                 ]
             )
+            if len(out) >= max(1, eff_limit):
+                break
         return out
+
+    def fetch_funding_rate(
+        self,
+        symbol: str | int,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        _ = params
+        m = self.resolve_market(symbol)
+        mid = int(m["market_id"])
+        resp = self.http.ticker(mid)
+        if not resp.get("ok") or "ticker" not in resp:
+            raise RuntimeError(f"GET /ticker failed: {resp}")
+        tk = resp["ticker"]
+        unified = self._unified_symbol_for_market(tk)
+        mark_t = int(tk.get("mark_price_ticks", 0))
+        mark_px = price_ticks_to_float(mark_t) if mark_t != 0 else None
+        if tk.get("funding_rate") is not None:
+            fr_val = float(tk["funding_rate"])
+        elif tk.get("funding_rate_bps") is not None:
+            fr_val = float(tk["funding_rate_bps"]) / 10000.0
+        else:
+            fr_val = 0.0
+        return {
+            "symbol": unified,
+            "marketId": mid,
+            "markPrice": mark_px,
+            "indexPrice": mark_px,
+            "fundingRate": fr_val,
+            "cumulativeFundingPhi": int(tk.get("cumulative_funding_phi", 0)),
+            "timestamp": None,
+            "datetime": None,
+            "fundingTimestamp": None,
+            "fundingDatetime": None,
+            "info": tk,
+        }
 
     def _effective_account_id(self, params: Optional[Dict[str, Any]] = None) -> int:
         aid = int((params or {}).get("account_id", self.account_id))
@@ -12168,6 +12393,11 @@ class ArenaCcxtAdapter:
         usd_free = micro_to_float(int(resp.get("free_usd_micro", 0)))
         usd_used = micro_to_float(int(resp.get("locked_usd_micro", 0)))
         usd_total = micro_to_float(int(resp.get("free_usd_micro", 0)) + int(resp.get("locked_usd_micro", 0)))
+        equity_usd = micro_to_float(int(resp.get("total_equity_micro", 0)))
+        withdrawable_usd = micro_to_float(int(resp.get("withdrawable_usd_micro", 0)))
+        info_dict = dict(resp)
+        info_dict["equity_usd"] = equity_usd
+        info_dict["withdrawable_usd"] = withdrawable_usd
         free_map: Dict[str, float] = {"USD": usd_free}
         used_map: Dict[str, float] = {"USD": usd_used}
         total_map: Dict[str, float] = {"USD": usd_total}
@@ -12176,9 +12406,9 @@ class ArenaCcxtAdapter:
             "free": free_map,
             "used": used_map,
             "total": total_map,
-            "equity_usd": micro_to_float(int(resp.get("total_equity_micro", 0))),
-            "withdrawable_usd": micro_to_float(int(resp.get("withdrawable_usd_micro", 0))),
-            "info": resp,
+            "equity_usd": equity_usd,
+            "withdrawable_usd": withdrawable_usd,
+            "info": info_dict,
         }
         for bb in list(resp.get("base_balances", [])):
             sym_raw = str(bb.get("symbol", f"ASSET_{bb.get('asset_id')}"))
@@ -12194,7 +12424,7 @@ class ArenaCcxtAdapter:
 
     def fetch_positions(
         self,
-        symbols: Optional[List[str | int]] = None,
+        symbols: Optional[Sequence[str | int]] = None,
         params: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         aid = self._effective_account_id(params)
@@ -12204,7 +12434,8 @@ class ArenaCcxtAdapter:
             raise RuntimeError(f"GET /account failed: {resp}")
         allowed_mids: Optional[set[int]] = None
         if symbols is not None:
-            allowed_mids = {int(self.resolve_market(s)["market_id"]) for s in symbols}
+            sym_seq: Sequence[str | int] = [symbols] if isinstance(symbols, (str, int)) else symbols
+            allowed_mids = {int(self.resolve_market(s)["market_id"]) for s in sym_seq}
         out: List[Dict[str, Any]] = []
         for pos in list(resp.get("perp_positions", [])):
             mid = int(pos["market_id"])
@@ -12241,8 +12472,12 @@ class ArenaCcxtAdapter:
     def fetch_open_orders(
         self,
         symbol: Optional[str | int] = None,
+        since: Optional[int] = None,
+        limit: Optional[int] = None,
         params: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
+        if isinstance(since, dict) and params is None:
+            params, since = since, None
         aid = self._effective_account_id(params)
         if not self.markets_by_id:
             self.load_markets(reload=False)
@@ -12250,16 +12485,23 @@ class ArenaCcxtAdapter:
         resp = self.http.account(aid)
         if not resp.get("ok"):
             raise RuntimeError(f"GET /account failed: {resp}")
+        since_i = int(since) if since is not None else None
         out: List[Dict[str, Any]] = []
         for o in list(resp.get("open_orders", [])):
             mid = int(o["market_id"])
             if target_mid is not None and mid != target_mid:
                 continue
+            if since_i is not None:
+                if o.get("timestamp") is not None and int(o["timestamp"]) < since_i:
+                    continue
+                if since_i < 100_000_000_000 and o.get("sequence_num") is not None and int(o["sequence_num"]) < since_i:
+                    continue
             entry = self.markets_by_id.get(mid)
             unified = entry["symbol"] if entry is not None else f"MARKET_{mid}"
             init_lots = int(o.get("initial_lots", 0))
             rem_lots = int(o.get("remaining_lots", 0))
             filled_lots = max(0, init_lots - rem_lots)
+            px_t = int(o.get("price_ticks", 0))
             out.append(
                 {
                     "id": str(o["order_id"]),
@@ -12267,16 +12509,20 @@ class ArenaCcxtAdapter:
                     "symbol": unified,
                     "side": "buy" if str(o.get("side", "bid")).lower() == "bid" else "sell",
                     "type": "limit",
-                    "price": price_ticks_to_float(int(o.get("price_ticks", 0))),
+                    "price": price_ticks_to_float(px_t),
                     "amount": qty_lots_to_float(init_lots),
                     "remaining": qty_lots_to_float(rem_lots),
                     "filled": qty_lots_to_float(filled_lots),
+                    "cost": micro_to_float(px_t * filled_lots) if filled_lots > 0 else 0.0,
                     "reduceOnly": bool(o.get("reduce_only", False)),
                     "status": "open",
                     "clientOrderId": str(o.get("client_tag", 0)) if int(o.get("client_tag", 0)) else None,
+                    "fee": {"cost": 0.0, "currency": "USD"},
                     "info": o,
                 }
             )
+            if limit is not None and len(out) >= max(0, int(limit)):
+                break
         return out
 
     def fetch_leaderboard(
@@ -12358,11 +12604,13 @@ class ArenaCcxtAdapter:
     def create_order(
         self,
         symbol: str | int,
-        order_type: str,
-        side: str,
-        amount: int | float | str | Decimal,
+        order_type: Optional[str] = None,
+        side: str = "buy",
+        amount: int | float | str | Decimal = 0.0,
         price: Optional[int | float | str | Decimal] = None,
         params: Optional[Dict[str, Any]] = None,
+        *,
+        type: Optional[str] = None,
     ) -> Dict[str, Any]:
         p = dict(params or {})
         m = self.resolve_market(symbol)
@@ -12371,7 +12619,8 @@ class ArenaCcxtAdapter:
         if aid <= 0:
             raise ValueError("account_id must be > 0 before placing orders")
         qty_lots = base_to_qty_lots(amount)
-        type_norm = str(order_type or "limit").strip().lower()
+        eff_type = order_type if order_type is not None else (type if type is not None else p.get("type", "limit"))
+        type_norm = str(eff_type or "limit").strip().lower()
         side_norm = str(side or "").strip().lower()
         if side_norm in ("buy", "bid"):
             side_str = "bid"
@@ -12420,7 +12669,20 @@ class ArenaCcxtAdapter:
         reduce_only = bool(p.get("reduceOnly", p.get("reduce_only", False)))
         post_only_slide = bool(p.get("post_only_slide", False))
         margin_spot = bool(p.get("margin_spot", False))
-        client_tag = int(p.get("client_tag", 0))
+        raw_client_oid = p.get("clientOrderId", p.get("client_order_id"))
+        if p.get("client_tag") is not None:
+            client_tag = int(p["client_tag"])
+        elif isinstance(raw_client_oid, str) and raw_client_oid.strip():
+            client_tag = _client_order_id_to_tag62(raw_client_oid)
+        elif isinstance(raw_client_oid, int) and raw_client_oid > 0:
+            client_tag = (int(raw_client_oid) & CANCEL_ALL_TAG_MASK) or 1
+        else:
+            client_tag = 0
+        resolved_client_oid = (
+            raw_client_oid.strip()
+            if isinstance(raw_client_oid, str) and raw_client_oid.strip()
+            else (str(client_tag) if client_tag > 0 else None)
+        )
         min_qty_lots = base_to_qty_lots(p["min_qty_base"]) if "min_qty_base" in p else int(p.get("min_qty_lots", 0))
         display_qty_lots = (
             base_to_qty_lots(p["display_qty_base"])
@@ -12469,9 +12731,14 @@ class ArenaCcxtAdapter:
                 raise RuntimeError(f"Wire place_order rejected ({wres.status_code.name})")
             filled_lots = int(wres.filled_lots)
             resting_lots = int(wres.resting_lots)
-            avg_px = price_ticks_to_float(wres.avg_price_ticks) if wres.avg_price_ticks != 0 else None
+            avg_px_t = int(wres.avg_price_ticks)
+            avg_px = price_ticks_to_float(avg_px_t) if avg_px_t != 0 else None
+            fee_micro = int(wres.fee_or_position)
+            exec_px_t = avg_px_t if avg_px_t != 0 else price_ticks
+            cost_val = micro_to_float(exec_px_t * filled_lots) if filled_lots > 0 else 0.0
             return {
                 "id": str(wres.order_id),
+                "clientOrderId": resolved_client_oid,
                 "symbol": self._unified_symbol_for_market(m),
                 "marketId": mid,
                 "type": type_norm,
@@ -12481,6 +12748,8 @@ class ArenaCcxtAdapter:
                 "amount": qty_lots_to_float(qty_lots),
                 "filled": qty_lots_to_float(filled_lots),
                 "remaining": qty_lots_to_float(resting_lots),
+                "cost": cost_val,
+                "fee": {"cost": micro_to_float(fee_micro), "currency": "USD"},
                 "status": _wire_status_from_order_res(wres.order_status.name, filled_lots, resting_lots),
                 "walSeq": int(wres.wal_seq),
                 "info": {
@@ -12491,7 +12760,9 @@ class ArenaCcxtAdapter:
                     "wal_seq": wres.wal_seq,
                     "filled_lots": filled_lots,
                     "resting_lots": resting_lots,
-                    "avg_price_ticks": wres.avg_price_ticks,
+                    "avg_price_ticks": avg_px_t,
+                    "net_fee_micro": fee_micro,
+                    "client_tag": client_tag,
                 },
             }
 
@@ -12530,8 +12801,12 @@ class ArenaCcxtAdapter:
         resting_lots = int(res.get("resting_lots", 0))
         avg_px_t = int(res.get("avg_price_ticks", 0))
         avg_px = price_ticks_to_float(avg_px_t) if avg_px_t != 0 else None
+        fee_micro = int(res.get("net_fee_micro", res.get("fee_micro", 0)))
+        exec_px_t = avg_px_t if avg_px_t != 0 else price_ticks
+        cost_val = micro_to_float(exec_px_t * filled_lots) if filled_lots > 0 else 0.0
         return {
             "id": str(res.get("order_id_str", res.get("order_id", 0))),
+            "clientOrderId": resolved_client_oid,
             "symbol": self._unified_symbol_for_market(m),
             "marketId": mid,
             "type": type_norm,
@@ -12541,10 +12816,34 @@ class ArenaCcxtAdapter:
             "amount": qty_lots_to_float(qty_lots),
             "filled": qty_lots_to_float(filled_lots),
             "remaining": qty_lots_to_float(resting_lots),
+            "cost": cost_val,
+            "fee": {"cost": micro_to_float(fee_micro), "currency": "USD"},
             "status": _wire_status_from_order_res(str(res.get("order_status", "")), filled_lots, resting_lots),
             "walSeq": int(res.get("wal_seq", 0)),
             "info": res,
         }
+
+    def create_limit_order(
+        self,
+        symbol: str | int,
+        side: str,
+        amount: int | float | str | Decimal,
+        price: int | float | str | Decimal,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return self.create_order(symbol, "limit", side, amount, price, params)
+
+    def create_market_order(
+        self,
+        symbol: str | int,
+        side: str,
+        amount: int | float | str | Decimal,
+        price: Optional[int | float | str | Decimal | Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if isinstance(price, dict) and params is None:
+            params, price = price, None
+        return self.create_order(symbol, "market", side, amount, price, params)
 
     def create_limit_buy_order(
         self,
@@ -12619,11 +12918,13 @@ class ArenaCcxtAdapter:
     def preview_order(
         self,
         symbol: str | int,
-        order_type: str,
-        side: str,
-        amount: int | float | str | Decimal,
+        order_type: Optional[str] = None,
+        side: str = "buy",
+        amount: int | float | str | Decimal = 0.0,
         price: Optional[int | float | str | Decimal] = None,
         params: Optional[Dict[str, Any]] = None,
+        *,
+        type: Optional[str] = None,
     ) -> Dict[str, Any]:
         p = dict(params or {})
         m = self.resolve_market(symbol)
@@ -12632,7 +12933,8 @@ class ArenaCcxtAdapter:
         if aid <= 0:
             raise ValueError("account_id must be > 0 before previewing orders")
         qty_lots = base_to_qty_lots(amount)
-        type_norm = str(order_type or "limit").strip().lower()
+        eff_type = order_type if order_type is not None else (type if type is not None else p.get("type", "limit"))
+        type_norm = str(eff_type or "limit").strip().lower()
         side_norm = str(side or "").strip().lower()
         if side_norm in ("buy", "bid"):
             side_str = "bid"
@@ -12654,6 +12956,15 @@ class ArenaCcxtAdapter:
         stp_raw = str(p.get("stp", "cancel_resting")).strip().lower()
         stp_dc = bool(p.get("stp_decrement_and_cancel", stp_raw in ("decrement_and_cancel", "dc")))
         reduce_only = bool(p.get("reduceOnly", p.get("reduce_only", False)))
+        raw_client_oid = p.get("clientOrderId", p.get("client_order_id"))
+        if p.get("client_tag") is not None:
+            client_tag = int(p["client_tag"])
+        elif isinstance(raw_client_oid, str) and raw_client_oid.strip():
+            client_tag = _client_order_id_to_tag62(raw_client_oid)
+        elif isinstance(raw_client_oid, int) and raw_client_oid > 0:
+            client_tag = (int(raw_client_oid) & CANCEL_ALL_TAG_MASK) or 1
+        else:
+            client_tag = 0
         min_qty_lots = base_to_qty_lots(p["min_qty_base"]) if "min_qty_base" in p else int(p.get("min_qty_lots", 0))
         display_qty_lots = (
             base_to_qty_lots(p["display_qty_base"])
@@ -12674,7 +12985,7 @@ class ArenaCcxtAdapter:
             is_market=is_market,
             post_only_slide=bool(p.get("post_only_slide", False)),
             min_qty_lots=min_qty_lots,
-            client_tag=int(p.get("client_tag", 0)),
+            client_tag=client_tag,
             primary_peg=bool(p.get("primary_peg", False)),
             midpoint_peg=bool(p.get("midpoint_peg", False)),
             margin_spot=bool(p.get("margin_spot", False)),
@@ -12791,15 +13102,34 @@ class ArenaCcxtAdapter:
 
     def cancel_order(
         self,
-        order_id: str | int,
-        symbol: str | int,
+        order_id: Optional[int | str] = None,
+        symbol: Optional[str | int] = None,
         params: Optional[Dict[str, Any]] = None,
+        *,
+        id: Optional[int | str] = None,
     ) -> Dict[str, Any]:
         p = dict(params or {})
-        m = self.resolve_market(symbol)
-        mid = int(m["market_id"])
+        eff_oid = order_id if order_id is not None else (id if id is not None else p.get("order_id", p.get("id")))
+        if eff_oid is None:
+            raise ValueError("order_id (or id=) is required to cancel an order")
+        oid = int(eff_oid)
         aid = self._effective_account_id(p)
-        oid = int(order_id)
+        eff_sym = symbol if symbol is not None else p.get("symbol", p.get("market_id"))
+        if eff_sym is not None:
+            m = self.resolve_market(eff_sym)
+        else:
+            acct_resp = self.http.account(aid)
+            if not acct_resp.get("ok"):
+                raise RuntimeError(f"GET /account failed while resolving order {oid}: {acct_resp}")
+            matched_mid: Optional[int] = None
+            for o in list(acct_resp.get("open_orders", [])):
+                if int(o.get("order_id", -1)) == oid:
+                    matched_mid = int(o["market_id"])
+                    break
+            if matched_mid is None:
+                raise ValueError("symbol (or market_id in params) is required when order is not in open_orders")
+            m = self.resolve_market(matched_mid)
+        mid = int(m["market_id"])
         if bool(p.get("use_binary_wire", False)):
             bin_cli = self._ensure_binary(account_id=aid)
             wres = bin_cli.cancel_order(market_id=mid, order_id=oid, account_id=aid)
@@ -12821,6 +13151,85 @@ class ArenaCcxtAdapter:
             "status": "canceled",
             "walSeq": int(res.get("wal_seq", 0)),
             "info": res,
+        }
+
+    def set_margin_mode(
+        self,
+        margin_mode: Optional[str] = None,
+        symbol: Optional[str | int] = None,
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        marginMode: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        p = dict(params or {})
+        raw_mode = (
+            margin_mode
+            if margin_mode is not None
+            else (marginMode if marginMode is not None else p.get("marginMode", p.get("margin_mode", "")))
+        )
+        mode_norm = str(raw_mode or "").strip().lower()
+        if mode_norm not in ("cross", "crossed"):
+            raise ValueError(
+                f"Unsupported marginMode {raw_mode!r}; Arena Exchange enforces unified Eigen-SPAN cross margin ('cross')"
+            )
+        eff_sym = symbol if symbol is not None else p.get("symbol", p.get("market_id"))
+        unified: Optional[str] = None
+        mid: Optional[int] = None
+        if eff_sym is not None:
+            m = self.resolve_market(eff_sym)
+            mid = int(m["market_id"])
+            unified = self._unified_symbol_for_market(m)
+        info_obj: Dict[str, Any] = {
+            "ok": True,
+            "margin_mode": "cross",
+            "engine": "eigen_span_cross_margin",
+            "market_id": mid,
+        }
+        return {
+            "ok": True,
+            "marginMode": "cross",
+            "symbol": unified,
+            "marketId": mid,
+            "info": info_obj,
+        }
+
+    def set_leverage(
+        self,
+        leverage: int | float | str | Decimal,
+        symbol: Optional[str | int] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        p = dict(params or {})
+        lev_f = float(leverage)
+        if not math.isfinite(lev_f) or lev_f <= 0.0:
+            raise ValueError(f"leverage must be > 0, got {leverage!r}")
+        eff_sym = symbol if symbol is not None else p.get("symbol", p.get("market_id"))
+        unified: Optional[str] = None
+        mid: Optional[int] = None
+        max_lev: Optional[float] = None
+        if eff_sym is not None:
+            m = self.resolve_market(eff_sym)
+            mid = int(m["market_id"])
+            unified = self._unified_symbol_for_market(m)
+            imr_bps = int(m.get("imr_bps", 0))
+            if imr_bps > 0:
+                max_lev = 10000.0 / float(imr_bps)
+        info_obj: Dict[str, Any] = {
+            "ok": True,
+            "noop": True,
+            "margin_mode": "cross",
+            "requested_leverage": lev_f,
+            "max_leverage": max_lev,
+            "market_id": mid,
+        }
+        return {
+            "ok": True,
+            "leverage": lev_f,
+            "marginMode": "cross",
+            "symbol": unified,
+            "marketId": mid,
+            "maxLeverage": max_lev,
+            "info": info_obj,
         }
 
     def cancel_all_orders(
@@ -12970,12 +13379,17 @@ class ArenaCcxtAdapter:
     fetchTicker = fetch_ticker
     fetchTickers = fetch_tickers
     fetchOrderBook = fetch_order_book
+    fetchL2OrderBook = fetch_l2_order_book
     fetchTrades = fetch_trades
+    fetchMyTrades = fetch_my_trades
     fetchOHLCV = fetch_ohlcv
+    fetchFundingRate = fetch_funding_rate
     fetchBalance = fetch_balance
     fetchPositions = fetch_positions
     fetchOpenOrders = fetch_open_orders
     createOrder = create_order
+    createLimitOrder = create_limit_order
+    createMarketOrder = create_market_order
     createLimitBuyOrder = create_limit_buy_order
     createLimitSellOrder = create_limit_sell_order
     createMarketBuyOrder = create_market_buy_order
@@ -12984,9 +13398,12 @@ class ArenaCcxtAdapter:
     editOrder = edit_order
     cancelOrder = cancel_order
     cancelAllOrders = cancel_all_orders
+    setLeverage = set_leverage
+    setMarginMode = set_margin_mode
     loginWithWallet = login_with_wallet
     setSandboxMode = set_sandbox_mode
     fetchLeaderboard = fetch_leaderboard
+    subscribeExpressPort = subscribe_express_port
 
 
 ArenaHftClient = ArenaBinaryClient
@@ -13343,6 +13760,230 @@ def _run_self_test() -> int:
             lb_rows = tn_ccxt.fetchLeaderboard(limit=5, sort="equity")
             if len(lb_rows) != 1 or lb_rows[0]["accountId"] != 1001 or abs(lb_rows[0]["equityUsd"] - 250.0) > 1e-9:
                 print(f"[FAIL] fetchLeaderboard mapping failed: {lb_rows}", file=sys.stderr)
+                return 1
+
+            # 6. Verify v4.9.3 CCXT compatibility attributes, signatures, clientOrderId tag62, fee/cost & new methods
+            if (
+                def_ccxt.options != {}
+                or def_ccxt.precisionMode != 4
+                or def_ccxt.fees != {"trading": {"maker": 0.0, "taker": 0.0}}
+                or def_ccxt.currencies != {}
+                or def_ccxt.features != {
+                    "spot": {"fetchOHLCV": {"limit": 240}},
+                    "swap": {"linear": {"fetchOHLCV": {"limit": 240}}},
+                }
+            ):
+                print("[FAIL] ArenaCcxtAdapter v4.9.3 CCXT instance attributes mismatch", file=sys.stderr)
+                return 1
+            for req_has in (
+                "createLimitOrder",
+                "createMarketOrder",
+                "fetchL2OrderBook",
+                "fetchMyTrades",
+                "setLeverage",
+                "setMarginMode",
+                "fetchFundingRate",
+            ):
+                if def_ccxt.has.get(req_has) is not True:
+                    print(f"[FAIL] ArenaCcxtAdapter.has missing {req_has}", file=sys.stderr)
+                    return 1
+            for req_alias in (
+                "createLimitOrder",
+                "createMarketOrder",
+                "fetchL2OrderBook",
+                "fetchMyTrades",
+                "setLeverage",
+                "setMarginMode",
+                "fetchFundingRate",
+            ):
+                if not callable(getattr(def_ccxt, req_alias, None)):
+                    print(f"[FAIL] ArenaCcxtAdapter missing camelCase method {req_alias}", file=sys.stderr)
+                    return 1
+            perp_entry = ccxt_from_dict.markets["BTC/USD:USD"]
+            spot_entry = ccxt_from_dict._build_ccxt_market_entry(
+                {"market_id": 2, "symbol": "BTC-USD-SPOT", "kind": "spot", "base_asset_id": 1}
+            )
+            if (
+                perp_entry.get("contractSize") != 1.0
+                or perp_entry.get("inverse") is not False
+                or perp_entry["limits"].get("cost") != {"min": None, "max": None}
+                or perp_entry["limits"].get("leverage") != {"min": 1.0, "max": None}
+                or spot_entry.get("contractSize") is not None
+                or spot_entry.get("inverse") is not None
+            ):
+                print(f"[FAIL] _build_ccxt_market_entry v4.9.3 fields mismatch: {perp_entry}", file=sys.stderr)
+                return 1
+
+            captured_place: Dict[str, Any] = {}
+            ccxt_from_dict.http.place_order = lambda **kw: (  # type: ignore[method-assign]
+                captured_place.update(kw)
+                or {
+                    "ok": True,
+                    "order_id": 888,
+                    "order_id_str": "888",
+                    "order_status": "filled",
+                    "wal_seq": 19,
+                    "filled_lots": 2000,
+                    "resting_lots": 0,
+                    "avg_price_ticks": 5_000_000,
+                    "net_fee_micro": 3_500_000,
+                }
+            )
+            ord_kw = ccxt_from_dict.create_order(
+                "BTC/USD:USD",
+                side="buy",
+                amount="0.2",
+                price="50000",
+                params={"clientOrderId": "gladiator-alpha-01"},
+                type="limit",
+            )
+            expected_tag = _client_order_id_to_tag62("gladiator-alpha-01")
+            if (
+                not (0 < expected_tag <= CANCEL_ALL_TAG_MASK)
+                or captured_place.get("client_tag") != expected_tag
+                or abs(float(ord_kw["cost"]) - 10_000.0) > 1e-9
+                or ord_kw.get("fee") != {"cost": 3.5, "currency": "USD"}
+            ):
+                print(f"[FAIL] create_order type=/clientOrderId/cost/fee failed: {ord_kw} / {captured_place}", file=sys.stderr)
+                return 1
+            lim_ord = ccxt_from_dict.createLimitOrder("BTC/USD:USD", "sell", 0.2, 50000.0)
+            mkt_ord = ccxt_from_dict.createMarketOrder("BTC/USD:USD", "buy", 0.2)
+            if lim_ord["type"] != "limit" or mkt_ord["type"] != "market":
+                print(f"[FAIL] createLimitOrder/createMarketOrder failed: {lim_ord} / {mkt_ord}", file=sys.stderr)
+                return 1
+
+            seen_cancel: Dict[str, Any] = {}
+            ccxt_from_dict.http.cancel_order = lambda account_id, market_id, order_id: (  # type: ignore[method-assign]
+                seen_cancel.update({"aid": account_id, "mid": market_id, "oid": order_id})
+                or {"ok": True, "wal_seq": 20}
+            )
+            c_kw = ccxt_from_dict.cancel_order(id="888", symbol="BTC/USD:USD")
+            if c_kw["id"] != "888" or seen_cancel.get("oid") != 888:
+                print(f"[FAIL] cancel_order(id=...) failed: {c_kw} / {seen_cancel}", file=sys.stderr)
+                return 1
+
+            ccxt_from_dict.http.book = lambda market_id, depth=20, include_l3=True: {  # type: ignore[method-assign]
+                "ok": True,
+                "wal_seq": 21,
+                "depth": depth,
+                "bids": [[5_000_000, 1000]],
+                "asks": [[5_001_000, 1500]],
+            }
+            ob_l2 = ccxt_from_dict.fetchL2OrderBook("BTC/USD:USD", limit=None, params={})
+            if ob_l2["info"]["depth"] != 50 or ob_l2["bids"][0] != [50000.0, 0.1]:
+                print(f"[FAIL] fetchL2OrderBook(limit=None) failed: {ob_l2}", file=sys.stderr)
+                return 1
+
+            ccxt_from_dict.http.candles = lambda market_id, interval="1m", limit=120: {  # type: ignore[method-assign]
+                "ok": True,
+                "candles": [
+                    [1000, 5_000_000, 5_010_000, 4_990_000, 5_005_000, 2500, 2],
+                    [2000, 5_005_000, 5_020_000, 5_000_000, 5_015_000, 3000, 3],
+                ],
+            }
+            bars_since = ccxt_from_dict.fetchOHLCV("BTC/USD:USD", "1m", since=1500, limit=None, params={})
+            if len(bars_since) != 1 or bars_since[0][0] != 2000:
+                print(f"[FAIL] fetchOHLCV(since=..., limit=None) failed: {bars_since}", file=sys.stderr)
+                return 1
+
+            ccxt_from_dict.http.trades = lambda market_id, limit=100: {  # type: ignore[method-assign]
+                "ok": True,
+                "trades": [
+                    {
+                        "trade_id": 1,
+                        "wal_seq": 10,
+                        "maker_account_id": 15,
+                        "taker_account_id": 99,
+                        "maker_order_id": 501,
+                        "taker_order_id": 502,
+                        "taker_side": "bid",
+                        "price_ticks": 5_000_000,
+                        "qty_lots": 1000,
+                        "notional_micro": 5_000_000_000,
+                        "maker_fee_micro": -500_000,
+                        "taker_fee_micro": 1_750_000,
+                    },
+                    {
+                        "trade_id": 2,
+                        "wal_seq": 11,
+                        "maker_account_id": 88,
+                        "taker_account_id": 99,
+                        "maker_order_id": 503,
+                        "taker_order_id": 504,
+                        "taker_side": "ask",
+                        "price_ticks": 4_999_000,
+                        "qty_lots": 1000,
+                        "notional_micro": 4_999_000_000,
+                        "maker_fee_micro": 0,
+                        "taker_fee_micro": 1_000_000,
+                    },
+                ],
+            }
+            my_trds = ccxt_from_dict.fetchMyTrades("BTC/USD:USD", since=None, limit=None)
+            if (
+                len(my_trds) != 1
+                or my_trds[0]["takerOrMaker"] != "maker"
+                or my_trds[0]["side"] != "sell"
+                or my_trds[0]["fee"]["cost"] != -0.5
+            ):
+                print(f"[FAIL] fetchMyTrades filtering/mapping failed: {my_trds}", file=sys.stderr)
+                return 1
+
+            ccxt_from_dict.http.ticker = lambda market_id=0: {  # type: ignore[method-assign]
+                "ok": True,
+                "ticker": {
+                    "market_id": 1,
+                    "symbol": "BTC-USD-PERP",
+                    "kind": "linear_perpetual",
+                    "mark_price_ticks": 5_005_000,
+                    "best_bid_ticks": 5_004_000,
+                    "best_ask_ticks": 5_006_000,
+                    "cumulative_funding_phi": 12_345,
+                },
+            }
+            fr_res = ccxt_from_dict.fetchFundingRate("BTC/USD:USD")
+            if fr_res["symbol"] != "BTC/USD:USD" or fr_res["markPrice"] != 50050.0 or fr_res["cumulativeFundingPhi"] != 12_345:
+                print(f"[FAIL] fetchFundingRate mapping failed: {fr_res}", file=sys.stderr)
+                return 1
+
+            mm_ok = ccxt_from_dict.setMarginMode("cross", "BTC/USD:USD")
+            lev_ok = ccxt_from_dict.setLeverage(10, "BTC/USD:USD")
+            if mm_ok["marginMode"] != "cross" or lev_ok["leverage"] != 10.0:
+                print(f"[FAIL] setMarginMode/setLeverage failed: {mm_ok} / {lev_ok}", file=sys.stderr)
+                return 1
+            caught_iso = False
+            try:
+                _ = ccxt_from_dict.setMarginMode("isolated", "BTC/USD:USD")
+            except ValueError:
+                caught_iso = True
+            if not caught_iso:
+                print("[FAIL] setMarginMode('isolated') did not raise ValueError", file=sys.stderr)
+                return 1
+
+            ccxt_from_dict.http.account = lambda account_id: {  # type: ignore[method-assign]
+                "ok": True,
+                "account_id": account_id,
+                "free_usd_micro": 80_000_000,
+                "locked_usd_micro": 20_000_000,
+                "total_equity_micro": 105_000_000,
+                "withdrawable_usd_micro": 75_000_000,
+                "base_balances": [],
+                "open_orders": [
+                    {"order_id": 1, "market_id": 1, "side": "bid", "price_ticks": 4_900_000, "initial_lots": 1000, "remaining_lots": 1000, "sequence_num": 5},
+                    {"order_id": 2, "market_id": 1, "side": "ask", "price_ticks": 5_100_000, "initial_lots": 1000, "remaining_lots": 1000, "sequence_num": 9},
+                ],
+            }
+            bal_chk = ccxt_from_dict.fetchBalance()
+            oo_chk = ccxt_from_dict.fetchOpenOrders("BTC/USD:USD", since=7, limit=1)
+            if (
+                bal_chk["equity_usd"] != 105.0
+                or bal_chk["withdrawable_usd"] != 75.0
+                or bal_chk["info"].get("equity_usd") != 105.0
+                or bal_chk["info"].get("withdrawable_usd") != 75.0
+                or len(oo_chk) != 1
+                or oo_chk[0]["id"] != "2"
+            ):
+                print(f"[FAIL] fetchBalance info mirror or fetchOpenOrders(since, limit) failed: {bal_chk} / {oo_chk}", file=sys.stderr)
                 return 1
         finally:
             tn_http.close()

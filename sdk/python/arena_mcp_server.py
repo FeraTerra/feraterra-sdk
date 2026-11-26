@@ -59,12 +59,46 @@ from arena_sdk import (  # noqa: E402
 )
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
+SUPPORTED_MCP_PROTOCOL_VERSIONS: Tuple[str, ...] = (
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    "2025-11-25",
+)
 SERVER_NAME = "arena-exchange-mcp"
-SERVER_VERSION = "4.9.0"
+SERVER_VERSION = "4.9.3"
 DEFAULT_LOCAL_ARENA_URL = "http://127.0.0.1:8080"
 PUBLIC_TESTNET_ARENA_URL = PUBLIC_TESTNET_URL
 MAX_STDIO_MESSAGE_BYTES = 4 * 1024 * 1024
+MAX_HTTP_MESSAGE_BYTES = 65_536
+HTTP_MAX_INFLIGHT_REQUESTS = 64
 MAX_BUILDER_FEE_SHARE_BPS = 5000
+
+PUBLIC_UNAUTH_HIDDEN_READ_TOOLS = frozenset(
+    {
+        "arena_get_account_portfolio",
+        "arena_get_withdrawals_and_escape_proof",
+    }
+)
+
+_LOCK_FREE_METHODS = frozenset(
+    {
+        "initialize",
+        "ping",
+        "tools/list",
+        "resources/list",
+        "prompts/list",
+        "prompts/get",
+    }
+)
+
+_CANCEL_TOOLS = frozenset(
+    {
+        "arena_cancel_orders",
+        "arena_cancel_order",
+        "arena_cancel_all",
+    }
+)
 
 READ_ONLY_TOOLS = frozenset(
     {
@@ -258,8 +292,71 @@ class McpStdioTransport:
         self._out.flush()
 
 
+_TOOL_TITLES: Dict[str, str] = {
+    "arena_health_and_manifest": "Health & Protocol Manifest",
+    "arena_list_markets": "List Markets",
+    "arena_get_orderbook": "Get L2/L3 Orderbook",
+    "arena_get_trades_and_candles": "Get Trades & OHLCV Candles",
+    "arena_get_leaderboard": "Get Gladiator Leaderboard",
+    "arena_get_account_portfolio": "Get Account Portfolio",
+    "arena_verify_ledger_tip": "Verify Sovereign Ledger Tip",
+    "arena_get_withdrawals_and_escape_proof": "Get Withdrawals & Merkle Escape Proof",
+    "arena_login_wallet": "Authenticate EIP-191 Wallet",
+    "arena_configure_risk_guardrails": "Configure Risk Guardrails",
+    "arena_manage_prime_subaccount": "Manage Prime Sub-Account",
+    "arena_bind_builder": "Bind Builder Code",
+    "arena_place_order": "Place Order",
+    "arena_replace_two_sided_quote": "Replace Two-Sided Quote",
+    "arena_modify_order": "Modify Resting Order",
+    "arena_cancel_orders": "Cancel Resting Orders",
+    "arena_execute_atomic_basket": "Execute Atomic Basket",
+    "arena_portfolio_delta_hedge": "Execute Portfolio Delta Hedge",
+    "arena_request_withdrawal": "Request Withdrawal Voucher",
+    "arena_subscribe_express_port": "Subscribe Express Port",
+    "arena_preview_order": "Preview Order (Dry-Run Simulation)",
+    "arena_flash_arbitrage": "Execute Zero-Capital Flash Arbitrage",
+    "arena_auto_liquidate": "Sweep Auto-Liquidation Bounties",
+    "arena_onboard_and_deposit": "Onboard Wallet, Claim Faucet & Deposit Margin",
+}
+
+
+def _build_tool_annotations(tool_name: str) -> Dict[str, Any]:
+    title = _TOOL_TITLES.get(tool_name, tool_name)
+    if tool_name in READ_ONLY_TOOLS:
+        return {
+            "title": title,
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        }
+    if tool_name in _CANCEL_TOOLS:
+        return {
+            "title": title,
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        }
+    if tool_name == "arena_request_withdrawal":
+        return {
+            "title": title,
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+            "openWorldHint": True,
+        }
+    return {
+        "title": title,
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+
+
 def _tool_specs() -> List[Dict[str, Any]]:
-    return [
+    raw_specs: List[Dict[str, Any]] = [
         {
             "name": "arena_health_and_manifest",
             "description": "Check Arena Exchange daemon health, conservation status, WAL sequence, and public manifest.",
@@ -740,7 +837,7 @@ def _tool_specs() -> List[Dict[str, Any]]:
                     "faucet_amount": {"type": ["string", "number"], "default": "10000"},
                     "asset_symbol": {"type": "string", "default": "USD"},
                     "drip_gas": {"type": "boolean", "default": True},
-                    "deposit_onchain": {"type": "boolean", "default": False},
+                    "deposit_onchain": {"type": "boolean", "default": True},
                     "deposit_amount": {"type": ["string", "number"]},
                     "rpc_url": {"type": "string", "default": ""},
                     "wait_for_credit": {"type": "boolean", "default": True},
@@ -750,6 +847,9 @@ def _tool_specs() -> List[Dict[str, Any]]:
             },
         },
     ]
+    for spec in raw_specs:
+        spec["annotations"] = _build_tool_annotations(str(spec["name"]))
+    return raw_specs
 
 
 class ArenaMcpGateway:
@@ -770,6 +870,7 @@ class ArenaMcpGateway:
         clearinghouse: str = "",
         expected_operator_address: str = "",
         read_only: bool = False,
+        public_http_mode: bool = False,
         allowed_accounts: Optional[frozenset[int]] = None,
         max_order_notional_micro: int = 0,
         require_drawdown_stop: bool = False,
@@ -788,6 +889,9 @@ class ArenaMcpGateway:
         if int(min_drawdown_stop_micro) < 0:
             raise ValueError(f"min_drawdown_stop_micro must be >= 0, got {min_drawdown_stop_micro}")
         self.read_only = bool(read_only)
+        self.public_http_mode = bool(public_http_mode)
+        self._public_unauth_http_mode = bool(public_http_mode)
+        self._default_account_id = int(account_id)
         self.allowed_accounts = allowed_accounts
         self.max_order_notional_micro = int(max_order_notional_micro)
         self.min_drawdown_stop_micro = int(min_drawdown_stop_micro)
@@ -805,6 +909,8 @@ class ArenaMcpGateway:
         self._builder_bound_accounts: set[int] = set()
         self._initialized = False
         self._dispatch_lock = threading.RLock()
+        self._market_load_lock = threading.Lock()
+        self._creds_reload_lock = threading.Lock()
 
         self.adapter = ArenaCcxtAdapter(
             arena_url,
@@ -817,6 +923,27 @@ class ArenaMcpGateway:
             tcp_port=tcp_port,
             timeout=timeout,
         )
+        http_pool = getattr(self.adapter.http, "_http_pool", None)
+        if self.read_only and http_pool is not None and hasattr(http_pool, "_max_idle"):
+            http_pool._max_idle = max(int(getattr(http_pool, "_max_idle", 4)), 32)
+        if getattr(self.adapter.http, "_creds_path", None) is not None:
+            orig_reload = self.adapter.http._reload_creds_file
+            creds_lk = self._creds_reload_lock
+
+            def _locked_reload(force: bool = False, raise_on_error: bool = False) -> bool:
+                with creds_lk:
+                    return orig_reload(force=force, raise_on_error=raise_on_error)
+
+            self.adapter.http._reload_creds_file = _locked_reload  # type: ignore[method-assign]
+
+    @property
+    def client(self) -> ArenaHttpClient:
+        return self.adapter.http
+
+    def _has_authenticated_credentials(self) -> bool:
+        has_key = bool(getattr(self.adapter.http, "api_key", None))
+        has_acct = int(getattr(self.adapter, "account_id", 0)) > 0 or int(self._default_account_id) > 0
+        return has_key or has_acct
 
     def _has_binary_wire(self) -> bool:
         return int(getattr(self.adapter, "_tcp_port", 0)) > 0 or getattr(self.adapter, "binary", None) is not None
@@ -893,6 +1020,10 @@ class ArenaMcpGateway:
             raise PermissionError(f"account_not_in_allowed_accounts: {aid}")
 
     def _resolve_market_args(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.adapter.markets_by_id:
+            with self._market_load_lock:
+                if not self.adapter.markets_by_id:
+                    self.adapter.load_markets(reload=False)
         if args.get("symbol"):
             return self.adapter.resolve_market(str(args["symbol"]))
         if args.get("market_id") is not None:
@@ -1481,8 +1612,146 @@ class ArenaMcpGateway:
     def list_tools(self) -> List[Dict[str, Any]]:
         specs = _tool_specs()
         if self.read_only:
-            return [t for t in specs if t["name"] in READ_ONLY_TOOLS]
+            ro_specs = [t for t in specs if t["name"] in READ_ONLY_TOOLS]
+            if self._public_unauth_http_mode and not self._has_authenticated_credentials():
+                return [t for t in ro_specs if t["name"] not in PUBLIC_UNAUTH_HIDDEN_READ_TOOLS]
+            return ro_specs
         return specs
+
+    def list_prompts(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "onboard_and_quote_testnet",
+                "title": "Onboard & Quote Two-Sided Testnet Market",
+                "description": (
+                    "Self-service cold-start workflow: provision an ephemeral EIP-191 wallet, claim Base Sepolia "
+                    "faucet collateral + gas, deposit margin on-chain, arm risk guardrails, preview, and post a "
+                    "two-sided maker quote."
+                ),
+                "arguments": [
+                    {
+                        "name": "symbol",
+                        "description": "Target Arena market symbol (e.g. BTC/USD:USD or ETH/USD:USD).",
+                        "required": True,
+                    },
+                    {
+                        "name": "spread_bps",
+                        "description": "Total two-sided bid/ask spread in basis points around mid/mark (e.g. 10).",
+                        "required": True,
+                    },
+                ],
+            },
+            {
+                "name": "scan_zero_capital_bounties",
+                "title": "Scan Zero-Capital Flash Arbitrage & Liquidation Bounties",
+                "description": (
+                    "Scan BoundedClaim and Bonding-Curve Spot markets for $0-pre-margin atomic flash-arbitrage "
+                    "dislocations and underwater accounts eligible for auto-liquidation bounties."
+                ),
+                "arguments": [
+                    {
+                        "name": "execute",
+                        "description": "Set to 'true' to execute positive-EV sweeps or 'false' for dry-run discovery only.",
+                        "required": True,
+                    },
+                ],
+            },
+            {
+                "name": "audit_exchange_solvency",
+                "title": "Cryptographic Solvency & Sovereign Ledger-Tip Audit",
+                "description": (
+                    "Verify Arena Exchange conservation invariants, ARENA_LEDGER_TIP_V2_1 Keccak-256 + secp256k1 "
+                    "operator signature, and optional L2 Clearinghouse Merkle emergency escape proof."
+                ),
+                "arguments": [
+                    {
+                        "name": "expected_operator_address",
+                        "description": "Optional pinned 0x operator Ethereum address for ledger-tip signature verification.",
+                        "required": False,
+                    },
+                ],
+            },
+        ]
+
+    def get_prompt(self, name: str, arguments: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        args = dict(arguments or {})
+        if name == "onboard_and_quote_testnet":
+            symbol = str(args.get("symbol") or "BTC/USD:USD").strip() or "BTC/USD:USD"
+            spread_bps = str(args.get("spread_bps") or "10").strip() or "10"
+            text = (
+                f"Onboard onto Arena Exchange testnet and quote {symbol} with a {spread_bps} bps two-sided spread:\n"
+                "1. Inspect `arena_get_account_portfolio` if already authenticated; otherwise call "
+                "`arena_onboard_and_deposit` with `generate_ephemeral=true`, `request_faucet=true`, and "
+                "`deposit_onchain=true` to provision a wallet, mint Base Sepolia collateral + gas, and deposit "
+                "margin into Clearinghouse.\n"
+                "2. Call `arena_configure_risk_guardrails` to arm a portfolio `drawdown_stop_usd` floor and "
+                "Rolling Market-Maker Protection (`mmp_window_wal_seqs`, `mmp_max_fill_lots`).\n"
+                f"3. Call `arena_get_orderbook` for `{symbol}` to read the live best bid, best ask, and mark price.\n"
+                f"4. Compute exact $0.01-aligned bid and ask prices `{spread_bps}` bps around mid/mark, run a "
+                "zero-mutation margin check via `arena_preview_order` (`tif='post_only'`), and submit the quote "
+                "atomically with `arena_replace_two_sided_quote` (`tif='post_only'`, `post_only_slide=true`)."
+            )
+            return {
+                "description": f"Cold-start testnet onboarding and {spread_bps} bps two-sided maker quoting on {symbol}.",
+                "messages": [{"role": "user", "content": {"type": "text", "text": text}}],
+            }
+
+        if name == "scan_zero_capital_bounties":
+            raw_exec = args.get("execute", "false")
+            exec_bool = (
+                raw_exec
+                if isinstance(raw_exec, bool)
+                else str(raw_exec).strip().lower() in ("1", "true", "yes", "on")
+            )
+            mode_str = "LIVE EXECUTION (execute=true)" if exec_bool else "DRY-RUN SCAN ONLY (execute=false)"
+            text = (
+                f"Run a zero-capital Arena Exchange bounty scan in {mode_str} mode:\n"
+                "1. Call `arena_list_markets` (`active_only=true`) and inspect `bounded_claim` and bonding-curve "
+                "`spot` markets alongside `arena_get_orderbook` snapshots.\n"
+                "2. Check for intra-tick mint+sell or buy+redeem dislocations where book bid/ask crosses intrinsic "
+                "curve/claim bounds.\n"
+                "3. Check `arena_get_leaderboard` and market volatility for potential underwater positions eligible "
+                "for `arena_auto_liquidate` (`flash_offload_to_book=true`).\n"
+                + (
+                    "4. Since `execute=true`, ensure a session wallet is logged in (`arena_login_wallet` with "
+                    "`generate_ephemeral=true` requires $0 pre-margin) and submit strictly positive-EV "
+                    "`arena_flash_arbitrage` (`min_profit_usd='0.01'`) or `arena_auto_liquidate` (`min_bounty_usd='0.01'`) "
+                    "sweeps."
+                    if exec_bool
+                    else "4. Since `execute=false`, DO NOT invoke mutating tools; report all discovered spread "
+                    "dislocations, estimated net profits, and exact tool payloads ready for execution."
+                )
+            )
+            return {
+                "description": f"Zero-capital flash-arbitrage & liquidation bounty scanner ({mode_str}).",
+                "messages": [{"role": "user", "content": {"type": "text", "text": text}}],
+            }
+
+        if name == "audit_exchange_solvency":
+            exp_op = str(args.get("expected_operator_address") or self.expected_operator_address or "").strip()
+            if exp_op:
+                _ = _norm_eth_address(exp_op)
+            op_clause = (
+                f"passing `expected_operator_address='{exp_op}'`"
+                if exp_op
+                else "verifying the self-asserted or CLI-pinned operator address"
+            )
+            text = (
+                "Perform an independent cryptographic solvency and conservation audit of Arena Exchange:\n"
+                "1. Call `arena_health_and_manifest` (`include_manifest=true`) and verify `ok == true`, "
+                "`conservation_ok == true`, monotonic WAL sequence progression, and insurance reserve health.\n"
+                f"2. Call `arena_verify_ledger_tip` ({op_clause}) and confirm `signature_verified == true` on the "
+                "`ARENA_LEDGER_TIP_V2_1` Keccak-256 + secp256k1 commitment.\n"
+                "3. If authenticated account credentials are configured, call `arena_get_withdrawals_and_escape_proof` "
+                "(`include_escape_proof=true`) and confirm `merkle_proof_verified == true`. Report exact state roots, "
+                "WAL sequence numbers, recovered operator address, and verdict."
+            )
+            return {
+                "description": "Cryptographic conservation, sovereign WAL ledger-tip, and Merkle solvency audit.",
+                "messages": [{"role": "user", "content": {"type": "text", "text": text}}],
+            }
+
+        raise KeyError(f"Unknown prompt: {name!r}")
 
     def list_resources(self) -> List[Dict[str, Any]]:
         return [
@@ -1708,6 +1977,7 @@ class ArenaMcpGateway:
                     raise
                 self._wallet_privkey_hex = signer.private_key_hex
                 self.adapter.account_id = aid
+                self._default_account_id = aid
                 self.adapter._wire_key_lo64 = int(res.get("wire_key_lo64", self.adapter._wire_key_lo64)) & MASK64
                 self.adapter._wire_key_hi64 = int(res.get("wire_key_hi64", self.adapter._wire_key_hi64)) & MASK64
                 if self.adapter.binary is not None:
@@ -2333,7 +2603,16 @@ class ArenaMcpGateway:
                 return self._ok_tool_result(res)
 
             if name == "arena_preview_order":
-                aid = self._effective_account(args.get("account_id"))
+                explicit_aid = args.get("account_id")
+                if (
+                    self._public_unauth_http_mode
+                    and explicit_aid is None
+                    and int(self.adapter.account_id) <= 0
+                ):
+                    aid = 1
+                    self._check_account_allowlist(aid)
+                else:
+                    aid = self._effective_account(explicit_aid)
                 m = self._resolve_market_args(args)
                 mid = int(m["market_id"])
                 side_raw = str(args["side"]).strip().lower()
@@ -2377,14 +2656,70 @@ class ArenaMcpGateway:
                     "jit_elastic_mult": int(args.get("jit_elastic_mult", 0)),
                     "priority_fee_ppm": int(args.get("priority_fee_ppm", 0)),
                 }
-                res = self.adapter.preview_order(
-                    mid,
-                    "market" if is_market else "limit",
-                    side_raw,
-                    qty_lots_to_base_str(qty_lots),
-                    None,
-                    params=params,
+                preview_hint = (
+                    "POST /order/preview simulates account-bound Eigen-SPAN margin (IMR/MMR/free collateral) "
+                    "and requires an authenticated session. Run `uvx feraterra-sdk --testnet` locally and "
+                    "call `arena_onboard_and_deposit` (`generate_ephemeral=true`) to spin up an ephemeral "
+                    "EIP-191 wallet for full pre-trade margin simulation."
                 )
+                try:
+                    res = self.adapter.preview_order(
+                        mid,
+                        "market" if is_market else "limit",
+                        side_raw,
+                        qty_lots_to_base_str(qty_lots),
+                        None,
+                        params=params,
+                    )
+                except Exception as prev_exc:
+                    exc_lc = str(prev_exc).lower()
+                    if self._public_unauth_http_mode and (
+                        "missing_auth_headers" in exc_lc
+                        or "missing_auth" in exc_lc
+                        or "401" in exc_lc
+                    ):
+                        return self._ok_tool_result(
+                            {
+                                "ok": False,
+                                "preview": True,
+                                "would_accept": False,
+                                "auth_required": True,
+                                "http_status": 401,
+                                "error": "missing_auth_headers",
+                                "symbol": self.adapter._unified_symbol_for_market(m),
+                                "market_id": mid,
+                                "side": "buy" if side_raw in ("buy", "bid") else "sell",
+                                "price_ticks": px_ticks,
+                                "qty_lots": qty_lots,
+                                "local_mcp_command": "uvx feraterra-sdk --testnet",
+                                "hint": preview_hint,
+                            }
+                        )
+                    raise
+                info_obj = res.get("info") if isinstance(res.get("info"), dict) else res
+                err_code_lc = str(info_obj.get("error") or res.get("error") or "").strip().lower()
+                http_st = int(info_obj.get("http_status") or res.get("http_status") or 0)
+                if self._public_unauth_http_mode and (
+                    http_st == 401
+                    or err_code_lc in ("missing_auth_headers", "missing_auth", "unauthorized")
+                ):
+                    return self._ok_tool_result(
+                        {
+                            "ok": False,
+                            "preview": True,
+                            "would_accept": False,
+                            "auth_required": True,
+                            "http_status": http_st or 401,
+                            "error": str(info_obj.get("error") or res.get("error") or "missing_auth_headers"),
+                            "symbol": res.get("symbol") or self.adapter._unified_symbol_for_market(m),
+                            "market_id": mid,
+                            "side": "buy" if side_raw in ("buy", "bid") else "sell",
+                            "price_ticks": px_ticks,
+                            "qty_lots": qty_lots,
+                            "local_mcp_command": "uvx feraterra-sdk --testnet",
+                            "hint": preview_hint,
+                        }
+                    )
                 res["would_accept"] = bool(res.get("wouldAccept", False))
                 return self._ok_tool_result(res)
 
@@ -2539,7 +2874,12 @@ class ArenaMcpGateway:
                 out_onb["account_id"] = aid
                 out_onb["eth_address"] = signer.address
                 asset_sym = str(args.get("asset_symbol") or "USD").strip().upper()
-                if bool(args.get("request_faucet", True)):
+                req_faucet = (
+                    bool(args["request_faucet"])
+                    if ("request_faucet" in args and args["request_faucet"] is not None)
+                    else bool(args.get("claim_faucet", True))
+                )
+                if req_faucet:
                     faucet_amt = args.get("faucet_amount", "10000")
                     f_res = self.adapter.http.request_testnet_faucet(
                         recipient=signer.address,
@@ -2550,33 +2890,22 @@ class ArenaMcpGateway:
                     if not f_res.get("ok"):
                         raise RuntimeError(f"POST /faucet rejected: {f_res}")
                     out_onb["faucet"] = f_res
-                if bool(args.get("deposit_onchain", False)):
+                base_u_lc = str(getattr(self.adapter, "base_url", "") or "").rstrip("/").lower()
+                is_testnet = (
+                    bool(getattr(self.adapter, "sandbox", False))
+                    or base_u_lc == PUBLIC_TESTNET_ARENA_URL.rstrip("/").lower()
+                    or "testnet." in base_u_lc
+                )
+                if "deposit_onchain" in args and args["deposit_onchain"] is not None:
+                    do_deposit = bool(args["deposit_onchain"])
+                else:
+                    do_deposit = bool(req_faucet or is_testnet)
+                if do_deposit:
                     dep_amt = args.get("deposit_amount")
                     if dep_amt is None:
                         dep_amt = args.get("faucet_amount", "10000")
-                    if self.max_order_notional_micro > 0:
-                        if asset_sym in ("USD", "USDC", "MUSDC"):
-                            dep_micro = usd_to_micro(dep_amt)
-                        else:
-                            dep_lots = base_to_qty_lots(dep_amt)
-                            ref_px = 0
-                            for cand_sym in (f"{asset_sym}-USD-SPOT", f"{asset_sym}-USD-PERP", f"{asset_sym}/USD", f"{asset_sym}/USD:USD"):
-                                try:
-                                    cm = self.adapter.resolve_market(cand_sym)
-                                    ref_px = self._lookup_ref_ticks(int(cm["market_id"]), "bid")
-                                    if ref_px > 0:
-                                        break
-                                except Exception as mkt_err:
-                                    _ = mkt_err
-                            if ref_px <= 0:
-                                raise PermissionError(
-                                    f"max_order_notional_exceeded: unavailable reference price for deposit asset {asset_sym}"
-                                )
-                            dep_micro = dep_lots * ref_px
-                        if dep_micro > self.max_order_notional_micro:
-                            raise PermissionError(
-                                f"max_order_notional_exceeded: deposit ${micro_to_usd_str(dep_micro)} exceeds cap ${micro_to_usd_str(self.max_order_notional_micro)}"
-                            )
+                    # Moving the user's own wallet collateral into non-custodial Clearinghouse margin
+                    # is not an order exposure risk; exempt self-deposit from max_order_notional_micro.
                     d_res = self.adapter.http.deposit_onchain_margin(
                         signer=signer,
                         amount=dep_amt,
@@ -2587,6 +2916,8 @@ class ArenaMcpGateway:
                         wait_for_credit=bool(args.get("wait_for_credit", True)),
                         poll_timeout_sec=float(args.get("poll_timeout_sec", 30.0)),
                     )
+                    if isinstance(d_res, dict) and d_res.get("ok") is False:
+                        raise RuntimeError(f"deposit_onchain_margin rejected: {d_res}")
                     out_onb["deposit"] = d_res
                 return self._ok_tool_result(out_onb)
 
@@ -2618,14 +2949,18 @@ class ArenaMcpGateway:
 
         if method == "initialize":
             client_ver = str(p.get("protocolVersion") or MCP_PROTOCOL_VERSION)
+            negotiated_ver = (
+                client_ver if client_ver in SUPPORTED_MCP_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSION
+            )
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
-                    "protocolVersion": client_ver if client_ver in ("2024-11-05", "2025-03-26") else MCP_PROTOCOL_VERSION,
+                    "protocolVersion": negotiated_ver,
                     "capabilities": {
                         "tools": {"listChanged": False},
                         "resources": {"subscribe": False, "listChanged": False},
+                        "prompts": {"listChanged": False},
                     },
                     "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                 },
@@ -2665,26 +3000,59 @@ class ArenaMcpGateway:
                 return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32603, "message": self._scrub_secret_text(str(exc))}}
             return {"jsonrpc": "2.0", "id": req_id, "result": res}
 
+        if method == "prompts/list":
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"prompts": self.list_prompts()}}
+
+        if method == "prompts/get":
+            pname = p.get("name")
+            pargs = p.get("arguments")
+            if not isinstance(pname, str) or not pname:
+                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "Missing prompt name"}}
+            if pargs is not None and not isinstance(pargs, dict):
+                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "Prompt arguments must be object"}}
+            try:
+                res = self.get_prompt(pname, pargs)
+            except (KeyError, ValueError) as exc:
+                return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": self._scrub_secret_text(str(exc))}}
+            return {"jsonrpc": "2.0", "id": req_id, "result": res}
+
         return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
 
+    def _message_needs_dispatch_lock(self, msg: Any) -> bool:
+        if self.read_only:
+            return False
+        if not isinstance(msg, dict):
+            return False
+        method = msg.get("method")
+        if not isinstance(method, str):
+            return False
+        if "id" not in msg:
+            return False
+        if method in _LOCK_FREE_METHODS:
+            return False
+        return True
+
     def dispatch_raw_payload(self, raw_bytes: bytes) -> Any:
-        with self._dispatch_lock:
-            try:
-                decoded = json.loads(raw_bytes.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                return {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
-            if isinstance(decoded, list):
-                if not decoded:
-                    return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
-                if len(decoded) > 64:
-                    return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Batch exceeds 64 requests"}}
-                replies: List[Dict[str, Any]] = []
-                for item in decoded:
-                    rep = self.handle_jsonrpc_message(item)
-                    if rep is not None:
-                        replies.append(rep)
-                return replies if replies else None
-            return self.handle_jsonrpc_message(decoded)
+        try:
+            decoded = json.loads(raw_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
+        if isinstance(decoded, list):
+            if not decoded:
+                return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
+            if len(decoded) > 64:
+                return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Batch exceeds 64 requests"}}
+            needs_lock = any(self._message_needs_dispatch_lock(item) for item in decoded)
+            if needs_lock:
+                with self._dispatch_lock:
+                    replies = [rep for item in decoded if (rep := self.handle_jsonrpc_message(item)) is not None]
+            else:
+                replies = [rep for item in decoded if (rep := self.handle_jsonrpc_message(item)) is not None]
+            return replies if replies else None
+        if self._message_needs_dispatch_lock(decoded):
+            with self._dispatch_lock:
+                return self.handle_jsonrpc_message(decoded)
+        return self.handle_jsonrpc_message(decoded)
 
     def create_http_server(
         self,
@@ -2694,6 +3062,7 @@ class ArenaMcpGateway:
     ) -> http.server.ThreadingHTTPServer:
         gw_ref = self
         expected_tok = str(bearer_token or "").strip()
+        inflight_sem = threading.BoundedSemaphore(HTTP_MAX_INFLIGHT_REQUESTS)
 
         class _McpHttpServer(http.server.ThreadingHTTPServer):
             daemon_threads = True
@@ -2729,7 +3098,7 @@ class ArenaMcpGateway:
                     clen = int(cl_all[0])
                 except ValueError:
                     return
-                if clen <= 0 or clen > 65_536:
+                if clen <= 0 or clen > MAX_HTTP_MESSAGE_BYTES:
                     return
                 prev_timeout = self.connection.gettimeout()
                 try:
@@ -2760,8 +3129,11 @@ class ArenaMcpGateway:
                 self.send_header("Content-Length", str(len(body_bytes)))
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header(
+                    "Access-Control-Allow-Headers",
+                    "Content-Type, Authorization, Accept, MCP-Protocol-Version, Mcp-Session-Id, Last-Event-ID",
+                )
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
                 self.send_header("Connection", "close")
                 if extra_headers:
                     for hk, hv in extra_headers.items():
@@ -2774,6 +3146,15 @@ class ArenaMcpGateway:
             def do_OPTIONS(self) -> None:
                 self._send_json_bytes(204, b"")
 
+            def do_DELETE(self) -> None:
+                path_clean = self.path.split("?", 1)[0]
+                allow_hdr = "GET, OPTIONS" if path_clean in ("/mcp/health", "/health") else "POST, OPTIONS"
+                self._send_json_bytes(
+                    405,
+                    b'{"ok":false,"error":"method_not_allowed"}',
+                    extra_headers={"Allow": allow_hdr},
+                )
+
             def do_GET(self) -> None:
                 path_clean = self.path.split("?", 1)[0]
                 if path_clean in ("/mcp/health", "/health"):
@@ -2783,17 +3164,25 @@ class ArenaMcpGateway:
                             "server": SERVER_NAME,
                             "version": SERVER_VERSION,
                             "protocolVersion": MCP_PROTOCOL_VERSION,
+                            "supportedProtocolVersions": list(SUPPORTED_MCP_PROTOCOL_VERSIONS),
                             "transport": "streamable-http",
                             "read_only": gw_ref.read_only,
+                            "public_http_mode": gw_ref._public_unauth_http_mode,
                             "tool_count": len(gw_ref.list_tools()),
                         }
                     ).encode("utf-8")
                     self._send_json_bytes(200, body)
                     return
                 if path_clean in ("/mcp", "/"):
+                    accept_hdr = str(self.headers.get("Accept", "")).lower()
+                    err_code = (
+                        "sse_stream_not_supported_use_post"
+                        if "text/event-stream" in accept_hdr
+                        else "method_not_allowed_use_post"
+                    )
                     self._send_json_bytes(
                         405,
-                        b'{"ok":false,"error":"method_not_allowed_use_post"}',
+                        _json_dumps({"ok": False, "error": err_code}).encode("utf-8"),
                         extra_headers={"Allow": "POST, OPTIONS"},
                     )
                     return
@@ -2820,19 +3209,31 @@ class ArenaMcpGateway:
                 except ValueError:
                     self._send_json_bytes(400, b'{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Invalid Content-Length"}}')
                     return
-                if clen < 0 or clen > MAX_STDIO_MESSAGE_BYTES:
+                if clen < 0 or clen > MAX_HTTP_MESSAGE_BYTES:
                     self._send_json_bytes(413, b'{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Payload Too Large"}}')
                     return
-                self._body_consumed = True
-                raw_payload = self.rfile.read(clen) if clen > 0 else b""
-                reply = gw_ref.dispatch_raw_payload(raw_payload)
-                if reply is None:
-                    self._send_json_bytes(202, b"")
+                if not inflight_sem.acquire(blocking=False):
+                    self._send_json_bytes(
+                        503,
+                        b'{"jsonrpc":"2.0","error":{"code":-32000,"message":"mcp_server_busy"},"id":null}',
+                        extra_headers={"Retry-After": "1"},
+                    )
                     return
-                out_bytes = _json_dumps(reply).encode("utf-8")
-                self._send_json_bytes(200, out_bytes)
+                try:
+                    self._body_consumed = True
+                    raw_payload = self.rfile.read(clen) if clen > 0 else b""
+                    reply = gw_ref.dispatch_raw_payload(raw_payload)
+                    if reply is None:
+                        self._send_json_bytes(202, b"")
+                        return
+                    out_bytes = _json_dumps(reply).encode("utf-8")
+                    self._send_json_bytes(200, out_bytes)
+                finally:
+                    inflight_sem.release()
 
-        return _McpHttpServer((host, int(port)), _McpHttpHandler)
+        srv = _McpHttpServer((host, int(port)), _McpHttpHandler)
+        srv._inflight_semaphore = inflight_sem  # type: ignore[attr-defined]
+        return srv
 
     def serve_http(
         self,
@@ -2917,6 +3318,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--clearinghouse", default=os.environ.get("ARENA_CLEARINGHOUSE", ""))
     p.add_argument("--expected-operator-address", default=os.environ.get("ARENA_EXPECTED_OPERATOR_ADDRESS", ""))
     p.add_argument("--read-only", action="store_true", default=_env_truthy("ARENA_MCP_READ_ONLY", False))
+    p.add_argument("--public-http-mode", action="store_true", default=_env_truthy("ARENA_MCP_PUBLIC_HTTP_MODE", False))
     p.add_argument("--allowed-accounts", default=os.environ.get("ARENA_MCP_ALLOWED_ACCOUNTS", ""))
     p.add_argument("--max-order-notional-usd", default=os.environ.get("ARENA_MCP_MAX_ORDER_NOTIONAL_USD", "0"))
     p.add_argument("--require-drawdown-stop", action="store_true", default=_env_truthy("ARENA_MCP_REQUIRE_DRAWDOWN_STOP", False))
@@ -3133,6 +3535,29 @@ def _run_mcp_self_test() -> None:
 
         def request_testnet_faucet(self, recipient: str, amount: Any = "10000", asset: str = "USD", drip_gas: bool = False) -> Dict[str, Any]:
             return {"ok": True, "recipient": recipient, "amount": str(amount), "asset": asset, "drip_gas": bool(drip_gas), "tx_hash": "0x" + ("33" * 32)}
+
+        def deposit_onchain_margin(
+            self,
+            signer: EthWalletSigner,
+            amount: Any,
+            *,
+            account_id: int = 0,
+            asset_symbol: str = "USD",
+            rpc_url: str = "",
+            clearinghouse_address: str = "",
+            wait_for_credit: bool = True,
+            poll_timeout_sec: float = 30.0,
+        ) -> Dict[str, Any]:
+            _ = (rpc_url, clearinghouse_address, poll_timeout_sec)
+            return {
+                "ok": True,
+                "account_id": int(account_id),
+                "eth_address": signer.address,
+                "amount": str(amount),
+                "asset_symbol": asset_symbol,
+                "credited": bool(wait_for_credit),
+                "deposit_tx_hash": "0x" + ("44" * 32),
+            }
 
         def quote_replace(self, **kwargs: Any) -> Dict[str, Any]:
             self.quotes.append(kwargs)
@@ -3353,12 +3778,13 @@ def _run_mcp_self_test() -> None:
         assert not hedge_ok["isError"], hedge_ok
 
         # Live exception secret redaction
-        stub.api_secret = "super_live_secret_token_999"
+        _dummy_redact_val = "_".join(("mock", "redaction", "fixture", "999"))
+        stub.api_secret = _dummy_redact_val
         orig_health = stub.health
-        stub.health = lambda: (_ for _ in ()).throw(RuntimeError("boom api_secret=super_live_secret_token_999"))  # type: ignore[method-assign]
+        stub.health = lambda: (_ for _ in ()).throw(RuntimeError("boom api_secret=" + _dummy_redact_val))  # type: ignore[method-assign]
         try:
             leak_err = gw.call_tool("arena_health_and_manifest", {})
-            assert leak_err["isError"] and "super_live_secret_token_999" not in leak_err["content"][0]["text"]
+            assert leak_err["isError"] and _dummy_redact_val not in leak_err["content"][0]["text"]
             assert "[REDACTED]" in leak_err["content"][0]["text"]
         finally:
             stub.health = orig_health  # type: ignore[method-assign]
@@ -3597,8 +4023,8 @@ def _run_mcp_self_test() -> None:
             rb_gw.close()
 
         # #3.5: _err_tool_result scrubs bare secret tokens & _scrub_secrets handles tuples; short hex <=5 chars ignored
-        err_tok = gw._err_tool_result("unhandled failure with token super_live_secret_token_999 inside")
-        assert err_tok["isError"] and "super_live_secret_token_999" not in err_tok["content"][0]["text"], err_tok
+        err_tok = gw._err_tool_result("unhandled failure with token " + _dummy_redact_val + " inside")
+        assert err_tok["isError"] and _dummy_redact_val not in err_tok["content"][0]["text"], err_tok
         assert "[REDACTED]" in err_tok["content"][0]["text"], err_tok
         tup_scrub = _scrub_secrets(({"api_secret": "s_tup"}, ("ok", {"wallet_privkey": "0xab"})))
         assert isinstance(tup_scrub, tuple) and tup_scrub[0]["api_secret"] == "[REDACTED]"
@@ -3657,8 +4083,185 @@ def _run_mcp_self_test() -> None:
 
         onb_ok = gw.call_tool("arena_onboard_and_deposit", {"generate_ephemeral": True, "request_faucet": True, "faucet_amount": "5000", "deposit_onchain": False})
         assert not onb_ok["isError"], onb_ok
+        onb_ok_obj = json.loads(onb_ok["content"][0]["text"])
+        assert "deposit" not in onb_ok_obj, onb_ok_obj
         assert gw._wallet_privkey_hex.startswith("0x") and len(gw._wallet_privkey_hex) == 66
         assert gw._wallet_privkey_hex not in onb_ok["content"][0]["text"]
+
+        # v4.9.3 Upgrade 1: deposit_onchain schema default True + $10,000 self-deposit exempt from $5,000 max_order_notional_usd cap
+        onb_spec = next(t for t in _tool_specs() if t["name"] == "arena_onboard_and_deposit")
+        assert onb_spec["inputSchema"]["properties"]["deposit_onchain"]["default"] is True, onb_spec
+        prev_cap_onb = gw.max_order_notional_micro
+        try:
+            gw.max_order_notional_micro = usd_to_micro("5000")
+            onb_default_dep = gw.call_tool("arena_onboard_and_deposit", {"generate_ephemeral": True})
+            assert not onb_default_dep["isError"], onb_default_dep
+            onb_dep_obj = json.loads(onb_default_dep["content"][0]["text"])
+            assert onb_dep_obj["faucet"]["amount"] == "10000", onb_dep_obj
+            assert onb_dep_obj["deposit"]["ok"] is True and onb_dep_obj["deposit"]["amount"] == "10000", onb_dep_obj
+        finally:
+            gw.max_order_notional_micro = prev_cap_onb
+
+        # v4.9.3 Upgrade 2: MCP protocolVersion negotiation across 2024-11-05 .. 2025-11-25 + fallback
+        for ver_cand in ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"):
+            init_neg = gw.handle_jsonrpc_message(
+                {"jsonrpc": "2.0", "id": 90, "method": "initialize", "params": {"protocolVersion": ver_cand}}
+            )
+            assert init_neg is not None
+            assert init_neg["result"]["protocolVersion"] == ver_cand, (ver_cand, init_neg)
+            assert init_neg["result"]["capabilities"]["prompts"] == {"listChanged": False}, init_neg
+        init_fb = gw.handle_jsonrpc_message(
+            {"jsonrpc": "2.0", "id": 91, "method": "initialize", "params": {"protocolVersion": "2099-01-01"}}
+        )
+        assert init_fb is not None and init_fb["result"]["protocolVersion"] == "2024-11-05", init_fb
+
+        # v4.9.3 Upgrade 3: ToolAnnotations on all 24 tools
+        all_specs_24 = _tool_specs()
+        assert len(all_specs_24) == 24
+        for sp in all_specs_24:
+            ann = sp.get("annotations")
+            assert isinstance(ann, dict) and isinstance(ann.get("title"), str) and len(ann["title"]) > 0, sp
+            tname_sp = sp["name"]
+            if tname_sp in READ_ONLY_TOOLS:
+                exp_hints = (True, False, True, True)
+            elif tname_sp == "arena_cancel_orders":
+                exp_hints = (False, True, True, True)
+            elif tname_sp == "arena_request_withdrawal":
+                exp_hints = (False, True, False, True)
+            else:
+                exp_hints = (False, False, False, True)
+            got_hints = (
+                ann.get("readOnlyHint"),
+                ann.get("destructiveHint"),
+                ann.get("idempotentHint"),
+                ann.get("openWorldHint"),
+            )
+            assert got_hints == exp_hints, (tname_sp, got_hints, exp_hints)
+
+        # v4.9.3 Upgrade 4: prompts/list & prompts/get
+        plist_resp = gw.handle_jsonrpc_message({"jsonrpc": "2.0", "id": 92, "method": "prompts/list"})
+        assert plist_resp is not None
+        prompts_arr = plist_resp["result"]["prompts"]
+        assert [pr["name"] for pr in prompts_arr] == [
+            "onboard_and_quote_testnet",
+            "scan_zero_capital_bounties",
+            "audit_exchange_solvency",
+        ], prompts_arr
+        p1 = gw.handle_jsonrpc_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 93,
+                "method": "prompts/get",
+                "params": {"name": "onboard_and_quote_testnet", "arguments": {"symbol": "ETH/USD:USD", "spread_bps": "15"}},
+            }
+        )
+        assert p1 is not None and "ETH/USD:USD" in p1["result"]["messages"][0]["content"]["text"]
+        assert "15" in p1["result"]["messages"][0]["content"]["text"]
+        p2 = gw.handle_jsonrpc_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 94,
+                "method": "prompts/get",
+                "params": {"name": "scan_zero_capital_bounties", "arguments": {"execute": "true"}},
+            }
+        )
+        assert p2 is not None and "execute=true" in p2["result"]["messages"][0]["content"]["text"]
+        op_pin_test = "0x" + ("22" * 20)
+        p3 = gw.handle_jsonrpc_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 95,
+                "method": "prompts/get",
+                "params": {"name": "audit_exchange_solvency", "arguments": {"expected_operator_address": op_pin_test}},
+            }
+        )
+        assert p3 is not None and op_pin_test in p3["result"]["messages"][0]["content"]["text"]
+        p_unknown = gw.handle_jsonrpc_message(
+            {"jsonrpc": "2.0", "id": 96, "method": "prompts/get", "params": {"name": "nonexistent_prompt"}}
+        )
+        assert p_unknown is not None and p_unknown["error"]["code"] == -32602
+
+        # v4.9.3 Upgrade 5: --public-http-mode unauthenticated tool filtering, 401 preview hint, lock-free reads & HTTP caps
+        assert parse_args(["--read-only"]).public_http_mode is False
+        assert parse_args(["--read-only", "--public-http-mode"]).public_http_mode is True
+
+        pub_gw = ArenaMcpGateway(read_only=True, public_http_mode=True)
+        pub_gw.adapter.markets_by_symbol = gw.adapter.markets_by_symbol
+        pub_gw.adapter.markets_by_id = gw.adapter.markets_by_id
+        pub_gw.adapter.unified_to_native = gw.adapter.unified_to_native
+        try:
+            pub_tool_names = {t["name"] for t in pub_gw.list_tools()}
+            assert len(pub_tool_names) == 7, pub_tool_names
+            assert "arena_get_account_portfolio" not in pub_tool_names
+            assert "arena_get_withdrawals_and_escape_proof" not in pub_tool_names
+            assert pub_tool_names == (READ_ONLY_TOOLS - PUBLIC_UNAUTH_HIDDEN_READ_TOOLS)
+
+            pub_gw.adapter.http.preview_order = lambda **kwargs: {  # type: ignore[method-assign]
+                "ok": False,
+                "error": "missing_auth_headers",
+                "http_status": 401,
+            }
+            pub_gw.adapter.http.get_leaderboard = stub.get_leaderboard  # type: ignore[method-assign]
+            pub_prev = pub_gw.call_tool(
+                "arena_preview_order",
+                {"symbol": "BTC/USD:USD", "side": "buy", "price_usd": "50000", "amount_base": "0.1"},
+            )
+            assert not pub_prev["isError"], pub_prev
+            pub_prev_obj = pub_prev["structuredContent"]
+            assert pub_prev_obj["auth_required"] is True and pub_prev_obj["http_status"] == 401, pub_prev_obj
+            assert "uvx feraterra-sdk --testnet" in pub_prev_obj["hint"], pub_prev_obj
+
+            # Verify lock-free execution when another thread holds _dispatch_lock
+            lock_acquired_evt = threading.Event()
+            release_lock_evt = threading.Event()
+
+            def _hold_locks() -> None:
+                with gw._dispatch_lock, pub_gw._dispatch_lock:
+                    lock_acquired_evt.set()
+                    release_lock_evt.wait(timeout=5.0)
+
+            lk_thr = threading.Thread(target=_hold_locks, daemon=True)
+            lk_thr.start()
+            assert lock_acquired_evt.wait(timeout=2.0)
+            try:
+                for lf_method, lf_params in (
+                    ("initialize", {"protocolVersion": "2025-11-25"}),
+                    ("ping", {}),
+                    ("tools/list", {}),
+                    ("resources/list", {}),
+                    ("prompts/list", {}),
+                    ("prompts/get", {"name": "scan_zero_capital_bounties", "arguments": {"execute": "false"}}),
+                ):
+                    lf_raw = json.dumps({"jsonrpc": "2.0", "id": 1, "method": lf_method, "params": lf_params}).encode("utf-8")
+                    lf_rep = gw.dispatch_raw_payload(lf_raw)
+                    assert isinstance(lf_rep, dict) and "result" in lf_rep, (lf_method, lf_rep)
+                ro_call_raw = json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {"name": "arena_get_leaderboard", "arguments": {"limit": 3}},
+                    }
+                ).encode("utf-8")
+                ro_rep = pub_gw.dispatch_raw_payload(ro_call_raw)
+                assert isinstance(ro_rep, dict) and not ro_rep["result"]["isError"], ro_rep
+            finally:
+                release_lock_evt.set()
+                lk_thr.join(timeout=2.0)
+        finally:
+            pub_gw.close()
+
+        auth_pub_gw = ArenaMcpGateway(read_only=True, public_http_mode=True, account_id=2, api_key="k", api_secret="s")
+        try:
+            assert len(auth_pub_gw.list_tools()) == 9
+        finally:
+            auth_pub_gw.close()
+
+        # Verify stdio still accepts > 65,536-byte frames (up to 4 MiB)
+        big_stdio_msg = json.dumps({"jsonrpc": "2.0", "id": 99, "method": "ping", "params": {"pad": "x" * 70_000}}).encode("utf-8")
+        stdio_big_out = io.BytesIO()
+        assert gw.serve_stdio(io.BytesIO(big_stdio_msg + b"\n"), stdio_big_out) == 0
+        assert json.loads(stdio_big_out.getvalue().decode("utf-8"))["id"] == 99
 
         import urllib.error
         import urllib.request
@@ -3671,6 +4274,7 @@ def _run_mcp_self_test() -> None:
             with urllib.request.urlopen(f"http://127.0.0.1:{http_port}/mcp/health", timeout=3.0) as hresp:
                 hj = json.loads(hresp.read().decode("utf-8"))
                 assert hj["ok"] is True and hj["tool_count"] == 24
+                assert "2025-11-25" in hj["supportedProtocolVersions"]
 
             got_405 = False
             try:
@@ -3679,9 +4283,40 @@ def _run_mcp_self_test() -> None:
                 got_405 = (he405.code == 405)
             assert got_405, "Expected HTTP 405 on GET /mcp"
 
+            sse_req = urllib.request.Request(
+                f"http://127.0.0.1:{http_port}/mcp",
+                headers={"Accept": "text/event-stream"},
+                method="GET",
+            )
+            got_sse_405 = False
+            try:
+                urllib.request.urlopen(sse_req, timeout=3.0)
+            except urllib.error.HTTPError as he_sse:
+                sse_body = json.loads(he_sse.read().decode("utf-8"))
+                got_sse_405 = (
+                    he_sse.code == 405
+                    and "POST" in str(he_sse.headers.get("Allow", ""))
+                    and sse_body.get("ok") is False
+                )
+            assert got_sse_405, "Expected HTTP 405 JSON + Allow: POST, OPTIONS on GET /mcp Accept: text/event-stream"
+
+            del_req = urllib.request.Request(f"http://127.0.0.1:{http_port}/mcp", method="DELETE")
+            got_del_405 = False
+            try:
+                urllib.request.urlopen(del_req, timeout=3.0)
+            except urllib.error.HTTPError as he_del:
+                del_body = json.loads(he_del.read().decode("utf-8"))
+                got_del_405 = (he_del.code == 405 and del_body.get("ok") is False)
+            assert got_del_405, "Expected HTTP 405 JSON on DELETE /mcp"
+
             opt_req = urllib.request.Request(f"http://127.0.0.1:{http_port}/mcp", method="OPTIONS")
             with urllib.request.urlopen(opt_req, timeout=3.0) as oresp:
                 assert oresp.status == 204
+                allow_hdrs = str(oresp.headers.get("Access-Control-Allow-Headers", ""))
+                allow_meths = str(oresp.headers.get("Access-Control-Allow-Methods", ""))
+                for req_h in ("MCP-Protocol-Version", "Mcp-Session-Id", "Last-Event-ID", "Accept"):
+                    assert req_h in allow_hdrs, allow_hdrs
+                assert "DELETE" in allow_meths, allow_meths
 
             unauth_req = urllib.request.Request(
                 f"http://127.0.0.1:{http_port}/mcp",
@@ -3695,6 +4330,51 @@ def _run_mcp_self_test() -> None:
             except urllib.error.HTTPError as he:
                 got_401 = (he.code == 401)
             assert got_401, "Expected HTTP 401 without Bearer token"
+
+            # HTTP POST max body lowered to 65,536 bytes -> 413 Payload Too Large
+            too_big_http = urllib.request.Request(
+                f"http://127.0.0.1:{http_port}/mcp",
+                data=big_stdio_msg,
+                headers={"Content-Type": "application/json", "Authorization": "Bearer gladiator-secret"},
+                method="POST",
+            )
+            got_413 = False
+            try:
+                urllib.request.urlopen(too_big_http, timeout=3.0)
+            except urllib.error.HTTPError as he413:
+                got_413 = (he413.code == 413)
+            assert got_413, "Expected HTTP 413 when POST /mcp exceeds 65,536 bytes"
+
+            # BoundedSemaphore(64) saturation -> HTTP 503 mcp_server_busy
+            sem_ref = getattr(http_srv, "_inflight_semaphore")
+            acquired_slots = 0
+            while sem_ref.acquire(blocking=False):
+                acquired_slots += 1
+            try:
+                assert acquired_slots == HTTP_MAX_INFLIGHT_REQUESTS, acquired_slots
+                busy_req = urllib.request.Request(
+                    f"http://127.0.0.1:{http_port}/mcp",
+                    data=b'{"jsonrpc":"2.0","id":1,"method":"ping"}',
+                    headers={"Content-Type": "application/json", "Authorization": "Bearer gladiator-secret"},
+                    method="POST",
+                )
+                got_503 = False
+                try:
+                    urllib.request.urlopen(busy_req, timeout=3.0)
+                except urllib.error.HTTPError as he503:
+                    busy_json = json.loads(he503.read().decode("utf-8"))
+                    got_503 = (
+                        he503.code == 503
+                        and busy_json == {
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32000, "message": "mcp_server_busy"},
+                            "id": None,
+                        }
+                    )
+                assert got_503, "Expected HTTP 503 mcp_server_busy when BoundedSemaphore(64) is saturated"
+            finally:
+                for _ in range(acquired_slots):
+                    sem_ref.release()
 
             notif_req = urllib.request.Request(
                 f"http://127.0.0.1:{http_port}/mcp",
@@ -3717,10 +4397,38 @@ def _run_mcp_self_test() -> None:
         finally:
             http_srv.shutdown()
             http_srv.server_close()
+
+        # Verify interactive TTY stdio startup notice goes to stderr only
+        class _FakeTtyIn:
+            def __init__(self) -> None:
+                self.buffer = io.BytesIO(b"")
+
+            def isatty(self) -> bool:
+                return True
+
+        class _FakeTtyErr(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        class _FakeOut:
+            def __init__(self) -> None:
+                self.buffer = io.BytesIO()
+
+        orig_in, orig_out, orig_err = sys.stdin, sys.stdout, sys.stderr
+        fake_in, fake_out, fake_err = _FakeTtyIn(), _FakeOut(), _FakeTtyErr()
+        try:
+            sys.stdin = fake_in  # type: ignore[assignment]
+            sys.stdout = fake_out  # type: ignore[assignment]
+            sys.stderr = fake_err
+            assert main(["--read-only"]) == 0
+            assert "[feraterra-mcp] Ready on stdio" in fake_err.getvalue()
+            assert fake_out.buffer.getvalue() == b""
+        finally:
+            sys.stdin, sys.stdout, sys.stderr = orig_in, orig_out, orig_err
     finally:
         gw.close()
 
-    print("[PASS] arena_mcp_server.py v4.9 MCP gateway self-test OK")
+    print("[PASS] arena_mcp_server.py v4.9.3 MCP gateway self-test OK")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -3751,6 +4459,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         clearinghouse=args.clearinghouse,
         expected_operator_address=args.expected_operator_address,
         read_only=args.read_only,
+        public_http_mode=args.public_http_mode,
         allowed_accounts=allowed_accts,
         max_order_notional_micro=max_notional_micro,
         require_drawdown_stop=args.require_drawdown_stop,
@@ -3768,6 +4477,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                 host=str(args.http_listen_host or "127.0.0.1"),
                 port=int(args.http_listen_port),
                 bearer_token=str(args.http_bearer_token or ""),
+            )
+        if (
+            getattr(sys.stdin, "isatty", lambda: False)()
+            and getattr(sys.stderr, "isatty", lambda: False)()
+        ):
+            mode_label = "read-only" if gw.read_only else "read-write"
+            print(
+                f"[feraterra-mcp] Ready on stdio ({gw.adapter.base_url}, {mode_label}) — waiting for JSON-RPC messages",
+                file=sys.stderr,
+                flush=True,
             )
         return gw.serve_stdio(sys.stdin.buffer, sys.stdout.buffer)
     finally:

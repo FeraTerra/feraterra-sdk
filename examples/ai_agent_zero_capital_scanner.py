@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional
+from unittest import mock
 
 SDK_DIR = Path(__file__).resolve().parent.parent / "sdk" / "python"
 if str(SDK_DIR) not in sys.path:
@@ -81,8 +82,8 @@ def scan_once(
             ba_t = int(m.get("best_ask_ticks", 0))
             bb_q = int(m.get("best_bid_lots", 0))
             ba_q = int(m.get("best_ask_lots", 0))
-            is_res = bool(m.get("resolved", False))
-            pay_t = int(m.get("resolved_payout_ticks", 0))
+            is_res = bool(m.get("claim_resolved", m.get("resolved", False)))
+            pay_t = int(m.get("claim_payout_ticks", m.get("resolved_payout_ticks", 0)))
             avail_q = ba_q if (is_res and pay_t > 0 and 0 < ba_t < pay_t) else bb_q
             opp = evaluate_claim_flash_arb_opportunity(
                 bb_t,
@@ -138,6 +139,43 @@ def _run_self_test() -> int:
     assert none_opp is None
     assert hit_opp is not None and hit_opp["side"] == "bid" and hit_opp["estimated_gross_profit_micro"] == 1_000
     assert res_opp is not None and res_opp["side"] == "ask" and res_opp["estimated_gross_profit_micro"] == 2_000
+
+    fake_http = mock.MagicMock()
+    fake_http.llms_txt.return_value = "Arena Exchange /order/preview"
+    fake_http.login_with_wallet.return_value = {"ok": True, "account_id": 42}
+    fake_http.markets.return_value = {
+        "ok": True,
+        "markets": [
+            {
+                "market_id": 101,
+                "symbol": "BTC-100K-YES",
+                "kind": "bounded_claim",
+                "claim_cap_ticks": 10_000,
+                "claim_resolved": True,
+                "claim_payout_ticks": 10_000,
+                "best_bid_ticks": 0,
+                "best_ask_ticks": 9_500,
+                "best_bid_lots": 0,
+                "best_ask_lots": 100,
+            },
+            {
+                "market_id": 102,
+                "symbol": "ETH-5K-YES",
+                "kind": "bounded_claim",
+                "claim_cap_ticks": 10_000,
+                "resolved": True,
+                "resolved_payout_ticks": 10_000,
+                "best_bid_ticks": 0,
+                "best_ask_ticks": 9_400,
+                "best_bid_lots": 0,
+                "best_ask_lots": 100,
+            },
+        ],
+    }
+    with mock.patch(f"{__name__}.ArenaHttpClient", return_value=fake_http):
+        scan_out = scan_once("http://127.0.0.1:8080", min_profit_usd="0.05", dry_run=True)
+    assert scan_out["ok"] is True and len(scan_out["flash_arb_candidates"]) == 2
+    assert {c["market_id"] for c in scan_out["flash_arb_candidates"]} == {101, 102}
     print("[PASS] ai_agent_zero_capital_scanner.py client self-test OK")
     return 0
 

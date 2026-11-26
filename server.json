@@ -3,7 +3,7 @@
   "name": "io.github.FeraTerra/feraterra-sdk",
   "title": "Arena Exchange Headless Trading & Risk MCP",
   "description": "Headless 24-tool MCP gateway for Arena Exchange spot, perps, previews, flash arb, and L2 custody.",
-  "version": "4.9.2",
+  "version": "4.9.3",
   "websiteUrl": "https://testnet.feraterra.app",
   "repository": {
     "url": "https://github.com/FeraTerra/feraterra-sdk",
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "feraterra-sdk",
-      "version": "4.9.2",
+      "version": "4.9.3",
       "transport": {
         "type": "stdio"
       },
@@ -23,6 +23,7 @@
           "description": "Arena network preset ('testnet' connects to https://testnet.feraterra.app; 'local' uses loopback).",
           "isRequired": false,
           "format": "string",
+          "default": "testnet",
           "isSecret": false
         },
         {
@@ -36,9 +37,9 @@
     },
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/FeraTerra/feraterra-sdk/releases/download/v4.9.2/feraterra-sdk.mcpb",
-      "fileSha256": "6eecc5ad6d0ceeb3b3fdf2f53b801afef03a903392613074a38e742f3c4d5550",
-      "version": "4.9.2",
+      "identifier": "https://github.com/FeraTerra/feraterra-sdk/releases/download/v4.9.3/feraterra-sdk.mcpb",
+      "fileSha256": "2da2f3948d8669ae00a114c6c6d861294a7409ea107ffe6010d71742e62ab89a",
+      "version": "4.9.3",
       "transport": {
         "type": "stdio"
       },
@@ -48,6 +49,7 @@
           "description": "Arena network preset ('testnet' connects to https://testnet.feraterra.app; 'local' uses loopback).",
           "isRequired": false,
           "format": "string",
+          "default": "testnet",
           "isSecret": false
         },
         {
@@ -58,6 +60,12 @@
           "isSecret": false
         }
       ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.feraterra.app/mcp"
     }
   ]
 }

@@ -1,0 +1,40 @@
+name: Public SDK & MCP CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-sdk-and-mcp:
+    name: Python 3.12 SDK/MCP & C++23 Header Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run arena_sdk.py deterministic self-test
+        run: python -B sdk/python/arena_sdk.py --self-test
+
+      - name: Run feraterra_sdk.py deterministic self-test
+        run: PYTHONPATH=sdk/python python -B sdk/python/feraterra_sdk.py --self-test
+
+      - name: Run arena_mcp_server.py 24-tool MCP self-test
+        run: python -B scripts/arena_mcp_server.py --self-test
+
+      - name: Run starter bot & preview self-tests
+        run: |
+          python -B examples/quickstart_ccxt_and_preview.py --self-test
+          python -B examples/algo_two_sided_quoter.py --self-test
+          python -B examples/ai_agent_zero_capital_scanner.py --self-test
+
+      - name: Verify C++23 header-only HFT wire & client syntax
+        run: g++ -std=c++23 -fsyntax-only -Iinclude include/arena_hft_client.hpp
