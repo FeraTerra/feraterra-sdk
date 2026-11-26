@@ -41,7 +41,7 @@ feraterra-sdk = "arena_mcp_server:main"
 [project.optional-dependencies]
 tls = ["certifi>=2024.0.0"]
 langchain = ["langchain-core>=0.3.0"]
-pydantic-ai = ["pydantic-ai-slim>=0.1.0"]
+pydantic-ai = ["pydantic-ai-slim>=2.54.0"]
 
 [tool.setuptools]
 package-dir = { "" = "sdk/python" }
