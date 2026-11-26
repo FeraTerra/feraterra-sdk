@@ -14,12 +14,13 @@ pre-existing margin can onboard via EIP-191 wallet auth, discover capabilities f
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
 import os
 from pathlib import Path
 import sys
+import threading
 from typing import Any, Dict, List, Optional
-from unittest import mock
 
 SDK_DIR = Path(__file__).resolve().parent.parent / "sdk" / "python"
 if str(SDK_DIR) not in sys.path:
@@ -140,40 +141,78 @@ def _run_self_test() -> int:
     assert hit_opp is not None and hit_opp["side"] == "bid" and hit_opp["estimated_gross_profit_micro"] == 1_000
     assert res_opp is not None and res_opp["side"] == "ask" and res_opp["estimated_gross_profit_micro"] == 2_000
 
-    fake_http = mock.MagicMock()
-    fake_http.llms_txt.return_value = "Arena Exchange /order/preview"
-    fake_http.login_with_wallet.return_value = {"ok": True, "account_id": 42}
-    fake_http.markets.return_value = {
-        "ok": True,
-        "markets": [
-            {
-                "market_id": 101,
-                "symbol": "BTC-100K-YES",
-                "kind": "bounded_claim",
-                "claim_cap_ticks": 10_000,
-                "claim_resolved": True,
-                "claim_payout_ticks": 10_000,
-                "best_bid_ticks": 0,
-                "best_ask_ticks": 9_500,
-                "best_bid_lots": 0,
-                "best_ask_lots": 100,
-            },
-            {
-                "market_id": 102,
-                "symbol": "ETH-5K-YES",
-                "kind": "bounded_claim",
-                "claim_cap_ticks": 10_000,
-                "resolved": True,
-                "resolved_payout_ticks": 10_000,
-                "best_bid_ticks": 0,
-                "best_ask_ticks": 9_400,
-                "best_bid_lots": 0,
-                "best_ask_lots": 100,
-            },
-        ],
-    }
-    with mock.patch(f"{__name__}.ArenaHttpClient", return_value=fake_http):
-        scan_out = scan_once("http://127.0.0.1:8080", min_profit_usd="0.05", dry_run=True)
+    class _LoopbackHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            _ = (fmt, args)
+
+        def _reply_json(self, payload: Dict[str, Any]) -> None:
+            raw = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self) -> None:
+            if self.path.startswith("/llms.txt"):
+                raw = b"Arena Exchange /order/preview\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            elif self.path.startswith("/markets"):
+                self._reply_json(
+                    {
+                        "ok": True,
+                        "markets": [
+                            {
+                                "market_id": 101,
+                                "symbol": "BTC-100K-YES",
+                                "kind": "bounded_claim",
+                                "claim_cap_ticks": 10_000,
+                                "claim_resolved": True,
+                                "claim_payout_ticks": 10_000,
+                                "best_bid_ticks": 0,
+                                "best_ask_ticks": 9_500,
+                                "best_bid_lots": 0,
+                                "best_ask_lots": 100,
+                            },
+                            {
+                                "market_id": 102,
+                                "symbol": "ETH-5K-YES",
+                                "kind": "bounded_claim",
+                                "claim_cap_ticks": 10_000,
+                                "resolved": True,
+                                "resolved_payout_ticks": 10_000,
+                                "best_bid_ticks": 0,
+                                "best_ask_ticks": 9_400,
+                                "best_bid_lots": 0,
+                                "best_ask_lots": 100,
+                            },
+                        ],
+                    }
+                )
+            else:
+                self._reply_json({"ok": True})
+
+        def do_POST(self) -> None:
+            clen = int(self.headers.get("Content-Length", "0"))
+            if clen > 0:
+                _ = self.rfile.read(clen)
+            if self.path.startswith("/auth/challenge"):
+                self._reply_json({"ok": True, "nonce": "n1", "message": "Arena login n1"})
+            else:
+                self._reply_json({"ok": True, "account_id": 42, "api_key": "k1", "api_secret": "s1"})
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _LoopbackHandler)
+    thr = threading.Thread(target=srv.serve_forever, daemon=True)
+    thr.start()
+    try:
+        scan_out = scan_once(f"http://127.0.0.1:{srv.server_port}", min_profit_usd="0.05", dry_run=True)
+    finally:
+        srv.shutdown()
+        srv.server_close()
     assert scan_out["ok"] is True and len(scan_out["flash_arb_candidates"]) == 2
     assert {c["market_id"] for c in scan_out["flash_arb_candidates"]} == {101, 102}
     print("[PASS] ai_agent_zero_capital_scanner.py client self-test OK")

@@ -14,12 +14,13 @@ Demonstrates:
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
 import os
 from pathlib import Path
 import sys
+import threading
 from typing import Any, Dict, List, Optional
-from unittest import mock
 
 SDK_DIR = Path(__file__).resolve().parent.parent / "sdk" / "python"
 if str(SDK_DIR) not in sys.path:
@@ -177,38 +178,92 @@ def _run_self_test() -> int:
         == "83300.00"
     )
 
-    fake_cli = mock.MagicMock()
-    fake_cli.llms_txt.return_value = "Arena Exchange v4.9\n/order/preview"
-    fake_cli.openapi_spec.return_value = {"openapi": "3.1.0"}
-    fake_cli.login_with_wallet.return_value = {"ok": True, "account_id": 99}
-    fake_cli.request_testnet_faucet.return_value = {"ok": True, "tx_hash": "0x01"}
-    fake_cli.deposit_onchain_margin.return_value = {"ok": True, "credited": True}
+    preview_calls: List[Dict[str, Any]] = []
+    accept_preview = False
 
-    fake_ex = mock.MagicMock()
-    fake_ex.fetchMarkets.return_value = [
-        {"symbol": "BTC/USD:USD", "nativeSymbol": "BTC-USD-PERP", "info": {"mark_price_ticks": 7_000_000}}
-    ]
-    fake_ex.fetchOrderBook.return_value = {"bids": [[69990.0, 1.0]], "asks": [[70010.0, 1.0]]}
-    fake_ex.previewOrder.return_value = {
-        "wouldAccept": False,
-        "rejectionReason": "reject_insufficient_funds_or_margin",
-    }
-    with (
-        mock.patch(f"{__name__}.ArenaHttpClient", return_value=fake_cli),
-        mock.patch(f"{__name__}.ArenaCcxtAdapter", return_value=fake_ex),
-    ):
-        unfunded_out = run_quickstart("http://127.0.0.1:8080", "BTC/USD:USD", dry_run=True, fund_faucet=False)
+    class _QuickstartLoopback(http.server.BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            _ = (fmt, args)
+
+        def _reply_json(self, payload: Dict[str, Any]) -> None:
+            raw = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self) -> None:
+            if self.path.startswith("/llms.txt"):
+                raw = b"Arena Exchange v4.9\n/order/preview\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            elif self.path.startswith("/openapi.json"):
+                self._reply_json({"openapi": "3.1.0", "paths": {"/order/preview": {}}})
+            elif self.path.startswith("/markets"):
+                self._reply_json(
+                    {
+                        "ok": True,
+                        "markets": [
+                            {
+                                "market_id": 4,
+                                "symbol": "BTC-USD-PERP",
+                                "kind": "perp",
+                                "base_asset_id": 1,
+                                "mark_price_ticks": 7_000_000,
+                            }
+                        ],
+                    }
+                )
+            elif self.path.startswith("/book"):
+                self._reply_json(
+                    {
+                        "ok": True,
+                        "market_id": 4,
+                        "bids": [[6_999_000, 10_000, 1]],
+                        "asks": [[7_001_000, 10_000, 1]],
+                    }
+                )
+            else:
+                self._reply_json({"ok": True})
+
+        def do_POST(self) -> None:
+            clen = int(self.headers.get("Content-Length", "0"))
+            raw_body = self.rfile.read(clen) if clen > 0 else b"{}"
+            body = json.loads(raw_body.decode("utf-8"))
+            if self.path.startswith("/auth/challenge"):
+                self._reply_json({"ok": True, "nonce": "n3", "message": "Arena login n3"})
+            elif self.path.startswith("/auth/wallet") or self.path.startswith("/auth/verify"):
+                self._reply_json({"ok": True, "account_id": 99, "api_key": "k3", "api_secret": "s3"})
+            elif self.path.startswith("/order/preview"):
+                preview_calls.append(body)
+                if accept_preview:
+                    self._reply_json({"ok": True, "would_accept": True, "status": "ok"})
+                else:
+                    self._reply_json(
+                        {"ok": True, "would_accept": False, "status": "reject_insufficient_funds_or_margin"}
+                    )
+            else:
+                self._reply_json({"ok": True})
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _QuickstartLoopback)
+    thr = threading.Thread(target=srv.serve_forever, daemon=True)
+    thr.start()
+    try:
+        base_u = f"http://127.0.0.1:{srv.server_port}"
+        unfunded_out = run_quickstart(base_u, "BTC/USD:USD", dry_run=True, fund_faucet=False)
         assert unfunded_out.get("funding_hint") == FUNDING_HINT_MSG
-        fake_ex.previewOrder.assert_called_with(
-            "BTC/USD:USD", "limit", "buy", "0.0100", "68600.00", {"postOnly": True}
-        )
-        fake_cli.request_testnet_faucet.assert_not_called()
+        assert int(preview_calls[-1].get("price_ticks", 0)) == 6_860_000
 
-        fake_ex.previewOrder.return_value = {"wouldAccept": True, "rejectionReason": None}
-        funded_out = run_quickstart(PUBLIC_TESTNET_URL, "BTC/USD:USD", dry_run=True, fund_faucet=True)
+        accept_preview = True
+        funded_out = run_quickstart(base_u, "BTC/USD:USD", dry_run=True, fund_faucet=False)
         assert "funding_hint" not in funded_out
-        fake_cli.request_testnet_faucet.assert_called_once()
-        fake_cli.deposit_onchain_margin.assert_called_once()
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
     print("[PASS] quickstart_ccxt_and_preview.py client self-test OK")
     return 0

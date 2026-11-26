@@ -15,14 +15,15 @@ from __future__ import annotations
 import argparse
 import contextlib
 from decimal import Decimal
+import http.server
 import io
 import json
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
-from unittest import mock
 
 SDK_DIR = Path(__file__).resolve().parent.parent / "sdk" / "python"
 if str(SDK_DIR) not in sys.path:
@@ -251,49 +252,90 @@ def _run_self_test() -> int:
     assert resolve_effective_peg_mode(True, None, 20) == 0
     assert parse_peg_mode("mark_peg") == 3
 
-    fake_http = mock.MagicMock()
-    fake_http.login_with_wallet.return_value = {"ok": True, "account_id": 77}
-    fake_http.book.return_value = {
-        "ok": True,
-        "mark_price_ticks": 7_000_000,
-        "best_bid_ticks": 6_999_000,
-        "best_ask_ticks": 7_001_000,
-    }
-    fake_http.account.return_value = {"ok": True, "perp_positions": []}
-    fake_http.quote_replace.return_value = {"ok": True, "status": "ok"}
+    quote_payloads: List[Dict[str, Any]] = []
+    reject_next_quote = False
 
-    with mock.patch(f"{__name__}.ArenaHttpClient", return_value=fake_http):
-        rep_def = run_quoter("http://127.0.0.1:8080", 4, "", dry_run=False)
+    class _QuoterLoopback(http.server.BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            _ = (fmt, args)
+
+        def _reply_json(self, code: int, payload: Dict[str, Any]) -> None:
+            raw = json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self) -> None:
+            if self.path.startswith("/book"):
+                self._reply_json(
+                    200,
+                    {
+                        "ok": True,
+                        "mark_price_ticks": 7_000_000,
+                        "best_bid_ticks": 6_999_000,
+                        "best_ask_ticks": 7_001_000,
+                    },
+                )
+            elif self.path.startswith("/account"):
+                self._reply_json(200, {"ok": True, "perp_positions": []})
+            else:
+                self._reply_json(200, {"ok": True})
+
+        def do_POST(self) -> None:
+            clen = int(self.headers.get("Content-Length", "0"))
+            raw_body = self.rfile.read(clen) if clen > 0 else b"{}"
+            body = json.loads(raw_body.decode("utf-8"))
+            if self.path.startswith("/auth/challenge"):
+                self._reply_json(200, {"ok": True, "nonce": "n2", "message": "Arena login n2"})
+            elif self.path.startswith("/auth/wallet") or self.path.startswith("/auth/verify"):
+                self._reply_json(200, {"ok": True, "account_id": 77, "api_key": "k2", "api_secret": "s2"})
+            elif self.path.startswith("/quote"):
+                quote_payloads.append(body)
+                if reject_next_quote:
+                    self._reply_json(400, {"ok": False, "status": "reject_insufficient_funds_or_margin"})
+                else:
+                    self._reply_json(200, {"ok": True, "status": "ok"})
+            else:
+                self._reply_json(200, {"ok": True})
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _QuoterLoopback)
+    thr = threading.Thread(target=srv.serve_forever, daemon=True)
+    thr.start()
+    try:
+        base_u = f"http://127.0.0.1:{srv.server_port}"
+        rep_def = run_quoter(base_u, 4, "", dry_run=False)
         assert rep_def[0]["ok"] is True
-        assert fake_http.quote_replace.call_args.kwargs["quote_peg_mode"] == 0
-        assert fake_http.quote_replace.call_args.kwargs["auto_skew_ticks"] == 15
-        assert fake_http.quote_replace.call_args.kwargs["auto_flip_ticks"] == 0
+        assert int(quote_payloads[-1].get("quote_peg_mode", 0)) == 0
+        assert int(quote_payloads[-1].get("auto_skew_ticks", 0)) == 15
+        assert int(quote_payloads[-1].get("auto_flip_ticks", 0)) == 0
 
-        rep_peg = run_quoter(PUBLIC_TESTNET_URL, 4, "", dry_run=False, peg_mode=3)
+        rep_peg = run_quoter(base_u, 4, "", dry_run=False, peg_mode=3)
         assert rep_peg[0]["ok"] is True
-        assert fake_http.quote_replace.call_args.kwargs["quote_peg_mode"] == 3
-        assert fake_http.quote_replace.call_args.kwargs["peg_offset_ticks"] == 250
-        assert fake_http.quote_replace.call_args.kwargs["bid_price_ticks"] == 0
-        assert fake_http.quote_replace.call_args.kwargs["ask_price_ticks"] == 0
-        assert fake_http.quote_replace.call_args.kwargs["auto_skew_ticks"] == 0
+        assert int(quote_payloads[-1].get("quote_peg_mode", 0)) == 3
+        assert int(quote_payloads[-1].get("peg_offset_ticks", 0)) == 250
+        assert int(quote_payloads[-1].get("bid_price_ticks", 0)) == 0
+        assert int(quote_payloads[-1].get("ask_price_ticks", 0)) == 0
+        assert int(quote_payloads[-1].get("auto_skew_ticks", 0)) == 0
 
-        rep_flip = run_quoter("http://127.0.0.1:8080", 4, "", dry_run=False, peg_mode=0, auto_flip_ticks=20)
+        rep_flip = run_quoter(base_u, 4, "", dry_run=False, peg_mode=0, auto_flip_ticks=20)
         assert rep_flip[0]["ok"] is True
-        assert fake_http.quote_replace.call_args.kwargs["quote_peg_mode"] == 0
-        assert fake_http.quote_replace.call_args.kwargs["auto_flip_ticks"] == 20
-        assert fake_http.quote_replace.call_args.kwargs["auto_skew_ticks"] == 0
+        assert int(quote_payloads[-1].get("quote_peg_mode", 0)) == 0
+        assert int(quote_payloads[-1].get("auto_flip_ticks", 0)) == 20
+        assert int(quote_payloads[-1].get("auto_skew_ticks", 0)) == 0
 
-        fake_http.quote_replace.return_value = {
-            "ok": False,
-            "status": "reject_insufficient_funds_or_margin",
-        }
+        reject_next_quote = True
         err_buf = io.StringIO()
         with contextlib.redirect_stderr(err_buf):
-            rep_rej = run_quoter(PUBLIC_TESTNET_URL, 4, "", cycles=3, dry_run=False, peg_mode=3)
+            rep_rej = run_quoter(base_u, 4, "", cycles=3, dry_run=False, peg_mode=3)
         assert len(rep_rej) == 1
         assert "/faucet" in rep_rej[0].get("funding_hint", "")
         assert "deposit_onchain_margin" in rep_rej[0].get("funding_hint", "")
         assert "/faucet" in err_buf.getvalue() and "deposit_onchain_margin" in err_buf.getvalue()
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
     print("[PASS] algo_two_sided_quoter.py client self-test OK")
     return 0
