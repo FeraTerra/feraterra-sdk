@@ -1,6 +1,8 @@
 <!-- mcp-name: io.github.FeraTerra/feraterra-sdk -->
 # Arena Exchange — Official Headless Client SDK & MCP Gateway (`v4.9.2`)
 
+[![FeraTerra/feraterra-sdk MCP server](https://glama.ai/mcp/servers/FeraTerra/feraterra-sdk/badges/score.svg)](https://glama.ai/mcp/servers/FeraTerra/feraterra-sdk)
+
 Zero-dependency client connectors and 24-tool MCP gateway for trading on **Arena Exchange** (`feraterra.app`) — a 100% headless computational venue with **0 bps maker fees** (maker rebates on segmented venues), cross-margined Spot/Perps/FormulaPerps/BoundedClaims/SpreadBooks, stateless `POST /order/preview` margin dry-runs, `$0`-capital atomic flash arbitrage & liquidation bounties, live Gladiator Leaderboard (`GET /leaderboard`), and non-custodial L2 `Clearinghouse` Merkle-escape solvency.
 
 - **Public Base Sepolia Testnet HTTPS:** `https://testnet.feraterra.app`
