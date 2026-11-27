@@ -70,7 +70,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterator, List, Optional, Sequence
 
-__version__ = "4.9.3"
+__version__ = "4.9.4"
 TICK_SIZE = 4
 ARENA_WIRE_BYTES = 64
 MASK50 = (1 << 50) - 1
@@ -12091,22 +12091,22 @@ class ArenaCcxtAdapter:
 
     def _format_ticker(self, m: Dict[str, Any]) -> Dict[str, Any]:
         unified = self._unified_symbol_for_market(m)
-        bid_t = int(m.get("best_bid_ticks", 0))
-        ask_t = int(m.get("best_ask_ticks", 0))
-        mark_t = int(m.get("mark_price_ticks", 0))
-        last_t = int(m.get("last_trade_price_ticks", 0)) or mark_t
+        bid_t = int(m.get("best_bid_ticks") or 0)
+        ask_t = int(m.get("best_ask_ticks") or 0)
+        mark_t = int(m.get("mark_price_ticks") or 0)
+        last_t = int(m.get("last_trade_price_ticks") or 0) or mark_t
         return {
             "symbol": unified,
             "nativeSymbol": m.get("symbol"),
-            "marketId": int(m.get("market_id", 0)),
+            "marketId": int(m.get("market_id") or 0),
             "bid": price_ticks_to_float(bid_t) if bid_t != 0 else None,
-            "bidVolume": qty_lots_to_float(int(m.get("best_bid_lots", 0))) if bid_t != 0 else 0.0,
+            "bidVolume": qty_lots_to_float(int(m.get("best_bid_lots") or 0)) if bid_t != 0 else 0.0,
             "ask": price_ticks_to_float(ask_t) if ask_t != 0 else None,
-            "askVolume": qty_lots_to_float(int(m.get("best_ask_lots", 0))) if ask_t != 0 else 0.0,
+            "askVolume": qty_lots_to_float(int(m.get("best_ask_lots") or 0)) if ask_t != 0 else 0.0,
             "last": price_ticks_to_float(last_t) if last_t != 0 else None,
             "markPrice": price_ticks_to_float(mark_t) if mark_t != 0 else None,
-            "baseVolume": qty_lots_to_float(int(m.get("total_volume_lots", 0))),
-            "quoteVolume": micro_to_float(int(m.get("total_quote_volume_micro", 0))),
+            "baseVolume": qty_lots_to_float(int(m.get("total_volume_lots") or 0)),
+            "quoteVolume": micro_to_float(int(m.get("total_quote_volume_micro") or 0)),
             "info": m,
         }
 
@@ -12930,8 +12930,8 @@ class ArenaCcxtAdapter:
         m = self.resolve_market(symbol)
         mid = int(m["market_id"])
         aid = int(p.get("account_id", self.account_id))
-        if aid <= 0:
-            raise ValueError("account_id must be > 0 before previewing orders")
+        if aid < 0:
+            raise ValueError("account_id must be >= 0 before previewing orders")
         qty_lots = base_to_qty_lots(amount)
         eff_type = order_type if order_type is not None else (type if type is not None else p.get("type", "limit"))
         type_norm = str(eff_type or "limit").strip().lower()
@@ -13984,6 +13984,59 @@ def _run_self_test() -> int:
                 or oo_chk[0]["id"] != "2"
             ):
                 print(f"[FAIL] fetchBalance info mirror or fetchOpenOrders(since, limit) failed: {bal_chk} / {oo_chk}", file=sys.stderr)
+                return 1
+
+            # 7. Verify v4.9.4 version, anonymous account_id=0 previewOrder, and empty-book fetchTicker null BBO
+            if __version__ != "4.9.4":
+                print(f"[FAIL] Expected __version__ == '4.9.4', got {__version__!r}", file=sys.stderr)
+                return 1
+            seen_anon_prev: Dict[str, Any] = {}
+            def_ccxt.markets = ccxt_from_dict.markets
+            def_ccxt.markets_by_symbol = ccxt_from_dict.markets_by_symbol
+            def_ccxt.markets_by_id = ccxt_from_dict.markets_by_id
+            def_ccxt.unified_to_native = ccxt_from_dict.unified_to_native
+            def_ccxt.http.preview_order = lambda **kw: (  # type: ignore[method-assign]
+                seen_anon_prev.update(kw)
+                or {
+                    "ok": True,
+                    "would_accept": True,
+                    "status": "Ok",
+                    "effective_price_ticks": kw["price_ticks"],
+                    "estimated_filled_lots": kw["qty_lots"],
+                    "estimated_resting_lots": 0,
+                    "estimated_avg_price_ticks": kw["price_ticks"],
+                    "estimated_fee_micro": 0,
+                    "wal_seq": 22,
+                }
+            )
+            anon_prev = def_ccxt.previewOrder("BTC/USD:USD", "limit", "buy", "0.0100", "50000.00")
+            if seen_anon_prev.get("account_id") != 0 or not anon_prev["wouldAccept"]:
+                print(f"[FAIL] Anonymous account_id=0 previewOrder failed: {seen_anon_prev} / {anon_prev}", file=sys.stderr)
+                return 1
+            caught_neg_aid = False
+            try:
+                _ = def_ccxt.previewOrder("BTC/USD:USD", "limit", "buy", "0.0100", "50000.00", {"account_id": -1})
+            except ValueError:
+                caught_neg_aid = True
+            if not caught_neg_aid:
+                print("[FAIL] previewOrder(account_id=-1) did not raise ValueError", file=sys.stderr)
+                return 1
+            ccxt_from_dict.http.ticker = lambda market_id=0: {  # type: ignore[method-assign]
+                "ok": True,
+                "ticker": {
+                    "market_id": 1,
+                    "symbol": "BTC-USD-PERP",
+                    "kind": "linear_perpetual",
+                    "mark_price_ticks": 5_005_000,
+                    "best_bid_ticks": 0,
+                    "best_ask_ticks": 0,
+                    "best_bid_lots": 0,
+                    "best_ask_lots": 0,
+                },
+            }
+            empty_tk = ccxt_from_dict.fetchTicker("BTC/USD:USD")
+            if empty_tk["bid"] is not None or empty_tk["ask"] is not None or empty_tk["markPrice"] != 50050.0:
+                print(f"[FAIL] Empty-book fetchTicker did not report bid=None, ask=None: {empty_tk}", file=sys.stderr)
                 return 1
         finally:
             tn_http.close()

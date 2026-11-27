@@ -14,10 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.12"
 
@@ -27,7 +27,7 @@ jobs:
       - name: Run feraterra_sdk.py deterministic self-test
         run: PYTHONPATH=sdk/python python -B sdk/python/feraterra_sdk.py --self-test
 
-      - name: Run arena_mcp_server.py 24-tool MCP self-test
+      - name: Run arena_mcp_server.py MCP self-test
         run: python -B scripts/arena_mcp_server.py --self-test
 
       - name: Run starter bot & preview self-tests
@@ -38,3 +38,29 @@ jobs:
 
       - name: Verify C++23 header-only HFT wire & client syntax
         run: g++ -std=c++23 -fsyntax-only -Iinclude include/arena_hft_client.hpp
+
+      - name: Verify CMake C++23 header-only targets (feraterra::wire & feraterra::hft_client)
+        run: |
+          mkdir -p /tmp/feraterra-cmake-smoke
+          cat << 'EOF' > /tmp/feraterra-cmake-smoke/CMakeLists.txt
+          cmake_minimum_required(VERSION 3.20)
+          project(feraterra_ci_smoke LANGUAGES CXX)
+          add_subdirectory("${GITHUB_WORKSPACE}" feraterra_sdk)
+          add_executable(hft_smoke smoke.cpp)
+          target_compile_options(hft_smoke PRIVATE -Wall -Wextra -Werror)
+          target_link_libraries(hft_smoke PRIVATE feraterra::wire feraterra::hft_client)
+          EOF
+          cat << 'EOF' > /tmp/feraterra-cmake-smoke/smoke.cpp
+          #include "arena_hft_client.hpp"
+          static_assert(sizeof(arena::wire::ArenaWireFrame) == 64);
+          int main() {
+              arena::sdk::ArenaHftWireClient client(1U);
+              return client.has_ambiguous_disconnect() ? 1 : 0;
+          }
+          EOF
+          cmake -S /tmp/feraterra-cmake-smoke -B /tmp/feraterra-cmake-smoke/build -DCMAKE_CXX_COMPILER=g++
+          cmake --build /tmp/feraterra-cmake-smoke/build
+          /tmp/feraterra-cmake-smoke/build/hft_smoke
+
+      - name: Verify Rust no_std feraterra-wire codec & golden vectors
+        run: cargo test --manifest-path crates/feraterra-wire/Cargo.toml

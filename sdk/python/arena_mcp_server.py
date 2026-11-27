@@ -1,5 +1,5 @@
 """
-Arena Exchange v4.9 — Zero-Dependency Model Context Protocol (MCP) JSON-RPC 2.0 Server
+Arena Exchange v4.9.4 — Zero-Dependency Model Context Protocol (MCP) JSON-RPC 2.0 Server
 (`scripts/arena_mcp_server.py`)
 
 Exposes Arena Exchange's headless HTTP REST, stateless `POST /order/preview`, 64-byte
@@ -7,7 +7,8 @@ binary TCP wire (`ArenaWire`), zero-capital flash-arbitrage & liquidation sweepe
 cryptographic ledger-tip/Merkle-escape verification, Prime sub-account/drawdown risk
 guardrails, self-service testnet onboarding, and `ArenaCcxtAdapter` market-normalization
 utilities over BOTH MCP `stdio` (newline-delimited JSON-RPC 2.0 + `Content-Length`
-framing) and Streamable HTTP (`POST /mcp`, `GET /mcp/health`).
+framing) and Streamable HTTP (`POST /mcp`, `GET /mcp/health`, `GET /mcp/server-card`,
+`GET /.well-known/mcp/server-card.json`).
 """
 from __future__ import annotations
 
@@ -66,7 +67,12 @@ SUPPORTED_MCP_PROTOCOL_VERSIONS: Tuple[str, ...] = (
     "2025-11-25",
 )
 SERVER_NAME = "arena-exchange-mcp"
-SERVER_VERSION = "4.9.3"
+SERVER_VERSION = "4.9.4"
+MCP_SERVER_CARD_SCHEMA = "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json"
+MCP_REGISTRY_NAME = "io.github.FeraTerra/feraterra-sdk"
+MCP_WEBSITE_URL = "https://feraterra.app"
+MCP_REPOSITORY_URL = "https://github.com/FeraTerra/feraterra-sdk"
+MCP_REMOTE_URL = "https://mcp.feraterra.app/mcp"
 DEFAULT_LOCAL_ARENA_URL = "http://127.0.0.1:8080"
 PUBLIC_TESTNET_ARENA_URL = PUBLIC_TESTNET_URL
 MAX_STDIO_MESSAGE_BYTES = 4 * 1024 * 1024
@@ -355,70 +361,170 @@ def _build_tool_annotations(tool_name: str) -> Dict[str, Any]:
     }
 
 
+def _build_server_card() -> Dict[str, Any]:
+    return {
+        "$schema": MCP_SERVER_CARD_SCHEMA,
+        "name": MCP_REGISTRY_NAME,
+        "title": "FeraTerra / Arena Exchange Headless Trading & Risk MCP",
+        "description": (
+            "Zero-dependency 24-tool MCP gateway for Arena Exchange spot, perps, "
+            "stateless order previews, zero-capital flash arbitrage, and L2 custody."
+        ),
+        "version": SERVER_VERSION,
+        "websiteUrl": MCP_WEBSITE_URL,
+        "repository": {
+            "url": MCP_REPOSITORY_URL,
+            "source": "github",
+        },
+        "remotes": [
+            {
+                "type": "streamable-http",
+                "url": MCP_REMOTE_URL,
+                "supportedProtocolVersions": list(SUPPORTED_MCP_PROTOCOL_VERSIONS),
+            }
+        ],
+    }
+
+
 def _tool_specs() -> List[Dict[str, Any]]:
     raw_specs: List[Dict[str, Any]] = [
         {
             "name": "arena_health_and_manifest",
-            "description": "Check Arena Exchange daemon health, conservation status, WAL sequence, and public manifest.",
+            "description": (
+                "Check Arena Exchange daemon liveness, double-entry conservation status, monotonic WAL sequence, "
+                "insurance reserve health, and public protocol manifest via GET /health and GET /. "
+                "Read-only diagnostics; use this for venue connectivity and manifest discovery, whereas "
+                "arena_verify_ledger_tip cryptographically verifies the operator-signed Keccak-256 ledger commitment."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "include_manifest": {"type": "boolean", "default": True},
+                    "include_manifest": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "When true, also fetches GET / protocol manifest metadata (endpoints, chain ID, Clearinghouse address) alongside GET /health.",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_list_markets",
-            "description": "List Arena Exchange markets (Spot, LinearPerpetual, FormulaPerpetual, BoundedClaim, SpreadBook) with exact tick/lot pricing and BBOs.",
+            "description": (
+                "List Arena Exchange markets (Spot, LinearPerpetual, FormulaPerpetual, BoundedClaim, SpreadBook) "
+                "with unified symbols, fixed-point tick/lot precision (`1 tick = $0.01`, `1 lot = 1e-4` base), "
+                "mark prices, and top-of-book BBOs (`null` when resting book side is empty). "
+                "Read-only market catalog; use arena_get_orderbook instead for multi-level L2/L3 depth on a single market."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "description": "Optional market kind filter (e.g. spot, perp, formula_perp, bounded_claim, spread_book)."},
-                    "symbol": {"type": "string", "description": "Optional exact or unified market symbol filter."},
-                    "active_only": {"type": "boolean", "default": True},
+                    "kind": {
+                        "type": "string",
+                        "description": "Optional market category filter ('spot', 'perp', 'formula_perp', 'bounded_claim', or 'spread_book'); empty string returns all kinds.",
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Optional case-insensitive market symbol filter matching native (e.g. 'BTC-USD-PERP') or CCXT unified (e.g. 'BTC/USD:USD') symbols.",
+                    },
+                    "active_only": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "When true, excludes halted instruments and returns only live/active tradable markets.",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_get_orderbook",
-            "description": "Fetch live L2/L3 orderbook snapshot for an Arena market by symbol (e.g. BTC/USD:USD or BTC-USD-PERP) or market_id.",
+            "description": (
+                "Fetch a live L2/L3 resting orderbook snapshot (bids, asks, mark price, and WAL sequence) for one Arena market. "
+                "Read-only; use this to inspect multi-level resting liquidity before sizing orders, whereas arena_list_markets "
+                "scans top-of-book BBOs across all markets and arena_get_trades_and_candles retrieves historical executions. "
+                "Provide either `symbol` or `market_id` (mutually exclusive market selectors)."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "symbol": {"type": "string"},
-                    "market_id": {"type": "integer", "minimum": 1},
-                    "depth": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
+                    "symbol": {
+                        "type": "string",
+                        "description": "Unified or native market symbol (e.g. 'BTC/USD:USD', 'BTC/USD', or 'BTC-USD-PERP'); mutually exclusive with market_id.",
+                    },
+                    "market_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Numeric Arena market identifier (>= 1); mutually exclusive with symbol.",
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "default": 20,
+                        "description": "Maximum number of resting price levels to return per book side (1..200, default 20).",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_get_trades_and_candles",
-            "description": "Fetch recent trades and OHLCV candles for an Arena market.",
+            "description": (
+                "Fetch recent matched trade prints and OHLCV candlestick bars (`1 tick = $0.01`, `1 lot = 1e-4` base) for a single Arena market. "
+                "Read-only; use this for historical price action and realized volume, whereas arena_get_orderbook inspects current "
+                "resting L2/L3 bid/ask liquidity. Provide either `symbol` or `market_id` (mutually exclusive market selectors)."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "symbol": {"type": "string"},
-                    "market_id": {"type": "integer", "minimum": 1},
-                    "interval": {"type": "string", "enum": ["tick", "1s", "1m"], "default": "1m"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 240, "default": 50},
+                    "symbol": {
+                        "type": "string",
+                        "description": "Unified or native market symbol (e.g. 'BTC/USD:USD' or 'BTC-USD-PERP'); mutually exclusive with market_id.",
+                    },
+                    "market_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Numeric Arena market identifier (>= 1); mutually exclusive with symbol.",
+                    },
+                    "interval": {
+                        "type": "string",
+                        "enum": ["tick", "1s", "1m"],
+                        "default": "1m",
+                        "description": "OHLCV candle aggregation timeframe: 'tick' (per-match), '1s' (1-second bars), or '1m' (1-minute bars).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 240,
+                        "default": 50,
+                        "description": "Maximum number of recent trades and OHLCV candles to return (1..240, default 50).",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_get_leaderboard",
-            "description": "Fetch the public Gladiator Leaderboard ranking active accounts by equity, PnL, maker BBO streak, volume, or ROI.",
+            "description": (
+                "Fetch the public Gladiator Leaderboard ranking active accounts by total equity, net PnL, maker BBO uptime streak, "
+                "notional volume, or ROI. Read-only public benchmark; use arena_get_account_portfolio instead to inspect private "
+                "positions, balances, and open orders for your authenticated account."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 25},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 25,
+                        "description": "Maximum number of ranked Gladiator accounts to return (1..100, default 25).",
+                    },
                     "sort": {
                         "type": "string",
                         "enum": ["equity", "pnl", "streak", "volume", "roi"],
                         "default": "equity",
+                        "description": "Ranking metric: 'equity' (total USD equity), 'pnl' (net PnL), 'streak' (maker BBO uptime epochs), 'volume', or 'roi'.",
                     },
                 },
                 "additionalProperties": False,
@@ -426,261 +532,858 @@ def _tool_specs() -> List[Dict[str, Any]]:
         },
         {
             "name": "arena_get_account_portfolio",
-            "description": "Inspect account USD balances, physical Spot collateral, perp/claim positions, equity, IMR/MMR, drawdown stop, builder binding, and open orders.",
+            "description": (
+                "Inspect an authenticated account's USD collateral (`1 micro = $1e-6`), Spot base holdings (`1 lot = 1e-4` base), "
+                "perpetual/claim positions, Eigen-SPAN IMR/MMR, active drawdown stop, builder binding, and resting open orders. "
+                "Read-only; use this for live margin, position, and open-order state, whereas arena_get_withdrawals_and_escape_proof "
+                "queries withdrawal vouchers and Merkle custody proofs and arena_get_leaderboard views public account rankings."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "account_id": {"type": "integer", "minimum": 1},
+                    "account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Target Arena account ID (>= 1); defaults to the authenticated session account_id when omitted.",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_verify_ledger_tip",
-            "description": "Fetch GET /ledger/tip and cryptographically verify its ARENA_LEDGER_TIP_V2_1 Keccak-256 + secp256k1 operator signature.",
+            "description": (
+                "Fetch GET /ledger/tip and cryptographically verify its ARENA_LEDGER_TIP_V2_1 Keccak-256 digest and secp256k1 "
+                "operator signature locally. Read-only solvency verifier; use this to verify the global WAL chain hash and state root, "
+                "whereas arena_get_withdrawals_and_escape_proof verifies per-account Clearinghouse Merkle escape proofs."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "expected_operator_address": {"type": "string", "description": "Optional 0x address overriding CLI pinned operator address."},
+                    "expected_operator_address": {
+                        "type": "string",
+                        "description": "Optional 0x-prefixed 20-byte Ethereum operator address to pin against the recovered secp256k1 signer (overrides --expected-operator-address).",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_get_withdrawals_and_escape_proof",
-            "description": "Fetch account withdrawal vouchers and optionally verify an off-chain or L1 log-reconstructed Merkle emergency escape proof.",
+            "description": (
+                "Fetch an account's off-chain withdrawal vouchers and optionally verify a Clearinghouse Merkle emergency escape proof "
+                "(off-chain or reconstructed from L1/L2 EVM logs). Read-only custody audit tool; use arena_request_withdrawal to "
+                "initiate a new withdrawal debit, or arena_get_account_portfolio to inspect live trading balances and open orders."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "account_id": {"type": "integer", "minimum": 1},
-                    "asset_id": {"type": "integer", "minimum": 0, "default": 0},
-                    "include_escape_proof": {"type": "boolean", "default": False},
-                    "pending": {"type": "boolean", "default": False},
-                    "expected_escape_merkle_root": {"type": "string"},
-                    "verify_from_onchain_logs": {"type": "boolean", "default": False},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 50},
+                    "account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Target Arena account ID (>= 1); defaults to the authenticated session account_id when omitted.",
+                    },
+                    "asset_id": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Collateral asset ID for Merkle escape proof lookup (0 = USD settlement collateral, >= 1 = Spot base asset ID).",
+                    },
+                    "include_escape_proof": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, fetches GET /settlement/escape_proof and cryptographically verifies leaf inclusion against the Merkle root.",
+                    },
+                    "pending": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true with include_escape_proof, inspects the pending settlement batch tree instead of the last finalized L2 root.",
+                    },
+                    "expected_escape_merkle_root": {
+                        "type": "string",
+                        "description": "Optional 0x-prefixed 32-byte Merkle root hash to pin verification against instead of the server-reported root.",
+                    },
+                    "verify_from_onchain_logs": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, reconstructs the account Merkle proof directly from Clearinghouse EVM logs (requires --rpc-url and --clearinghouse).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 2000,
+                        "default": 50,
+                        "description": "Maximum number of withdrawal voucher records to return (1..2000, default 50).",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_login_wallet",
-            "description": "Authenticate an Ethereum wallet via EIP-191 challenge/signature into this MCP session (secrets are bound internally and never echoed back).",
+            "description": (
+                "Authenticate an Ethereum wallet into this MCP session via EIP-191 challenge-response signing (API/wire session "
+                "secrets stay bound in-memory and are never echoed). Mutates local session credentials only; use this when your "
+                "wallet is already funded or for $0-pre-margin flash arbitrage, whereas arena_onboard_and_deposit also claims "
+                "testnet faucet collateral and deposits margin on-chain."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "generate_ephemeral": {"type": "boolean", "default": False},
+                    "generate_ephemeral": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, generates a fresh CSPRNG secp256k1 wallet in-memory for this session instead of using --wallet-privkey.",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_configure_risk_guardrails",
-            "description": "Configure agent risk limits: portfolio drawdown kill-switch, per-position Knock-Out barrier, Rolling MMP, and TCP Cancel-on-Disconnect.",
+            "description": (
+                "Configure server-enforced account risk guardrails: portfolio equity drawdown kill-switch, per-position Knock-Out "
+                "price barrier, Rolling Market-Maker Protection (MMP), and TCP Cancel-on-Disconnect. Mutates account risk settings "
+                "(required before risk-increasing tools when --require-drawdown-stop is active); use arena_get_account_portfolio "
+                "to read current guardrail values. Provide mutually exclusive decimal vs integer fields (`drawdown_stop_usd` vs "
+                "`drawdown_stop_usd_micro`, `knockout_symbol` vs `knockout_market_id`, `knockout_price_usd` vs `knockout_price_ticks`)."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "account_id": {"type": "integer", "minimum": 1},
-                    "drawdown_stop_usd": {"type": ["string", "number"]},
-                    "drawdown_stop_usd_micro": {"type": "integer", "minimum": 0},
-                    "knockout_symbol": {"type": "string"},
-                    "knockout_market_id": {"type": "integer", "minimum": 1},
-                    "knockout_price_usd": {"type": ["string", "number"]},
-                    "knockout_price_ticks": {"type": "integer", "minimum": 0},
-                    "mmp_window_wal_seqs": {"type": "integer", "minimum": 0, "maximum": 65535},
-                    "mmp_max_fill_lots": {"type": "integer", "minimum": 0},
-                    "mmp_max_delta_lots": {"type": "integer", "minimum": 0},
-                    "mmp_cooldown_wal_seqs": {"type": "integer", "minimum": 0, "maximum": 65535},
-                    "cancel_on_disconnect": {"type": "boolean"},
-                    "cod_market_id": {"type": "integer", "minimum": 0, "maximum": 65535, "default": 0},
-                    "cod_timeout_ms": {"type": "integer", "minimum": 0, "maximum": 86400000, "default": 0},
+                    "account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Target Arena account ID (>= 1); defaults to the authenticated session account_id when omitted.",
+                    },
+                    "drawdown_stop_usd": {
+                        "type": ["string", "number"],
+                        "description": "Exact USD equity kill-switch floor as decimal string or number (e.g. '9500.00'; '0' disables when permitted); mutually exclusive with drawdown_stop_usd_micro.",
+                    },
+                    "drawdown_stop_usd_micro": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Portfolio equity kill-switch floor in integer micro-USD (1 micro = $1e-6, 0 = disable when permitted); mutually exclusive with drawdown_stop_usd.",
+                    },
+                    "knockout_symbol": {
+                        "type": "string",
+                        "description": "Unified or native market symbol (e.g. 'BTC/USD:USD') for per-position Knock-Out barrier; mutually exclusive with knockout_market_id.",
+                    },
+                    "knockout_market_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Numeric Arena market ID (>= 1) for per-position Knock-Out barrier; mutually exclusive with knockout_symbol.",
+                    },
+                    "knockout_price_usd": {
+                        "type": ["string", "number"],
+                        "description": "Per-position Knock-Out trigger price in exact USD (e.g. '48500.00', multiple of $0.01; '0' clears barrier); mutually exclusive with knockout_price_ticks.",
+                    },
+                    "knockout_price_ticks": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Per-position Knock-Out trigger price in integer ticks (1 tick = $0.01, 0 = clear barrier); mutually exclusive with knockout_price_usd.",
+                    },
+                    "mmp_window_wal_seqs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 65535,
+                        "description": "Rolling Market-Maker Protection lookback window in WAL sequence increments (0..65535, 0 = disable MMP).",
+                    },
+                    "mmp_max_fill_lots": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Maximum cumulative maker fill size in integer lots (1 lot = 1e-4 base, 0 = uncapped) within mmp_window_wal_seqs before MMP triggers.",
+                    },
+                    "mmp_max_delta_lots": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Maximum net signed maker delta in integer lots (1 lot = 1e-4 base, 0 = uncapped) within mmp_window_wal_seqs before MMP triggers.",
+                    },
+                    "mmp_cooldown_wal_seqs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 65535,
+                        "description": "Cooldown duration in WAL sequence increments (0..65535) blocking new maker quotes after an MMP breach.",
+                    },
+                    "cancel_on_disconnect": {
+                        "type": "boolean",
+                        "description": "Enable (true) or disable (false) automatic resting order cancellation on TCP binary wire disconnect (requires --tcp-port > 0).",
+                    },
+                    "cod_market_id": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 65535,
+                        "default": 0,
+                        "description": "Market ID scope for Cancel-on-Disconnect (0 = all markets across session, 1..65535 = single market).",
+                    },
+                    "cod_timeout_ms": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 86400000,
+                        "default": 0,
+                        "description": "Grace timeout in milliseconds (0..86400000, 0 = cancel immediately upon socket disconnect) before sweeping orders.",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_manage_prime_subaccount",
-            "description": "Link, unlink (max_guaranty=-2), or execute 0-bps internal USD/base transfers between Prime master and sub-accounts.",
+            "description": (
+                "Link or unlink (`max_guaranty_usd_micro=-2`) a Prime sub-account cross-margin guaranty, or execute 0-bps internal "
+                "USD/Spot transfers between linked accounts. Mutates Prime account links or internal balances; use "
+                "arena_request_withdrawal instead for external L2 Ethereum withdrawals. Provide mutually exclusive decimal "
+                "(`max_guaranty_usd`, `amount_usd`, `amount_base`) vs fixed-point integer (`max_guaranty_usd_micro`, `amount`) fields."
+            ),
             "inputSchema": {
                 "type": "object",
                 "required": ["action"],
                 "properties": {
-                    "action": {"type": "string", "enum": ["link", "unlink", "transfer"]},
-                    "master_account_id": {"type": "integer", "minimum": 1},
-                    "sub_account_id": {"type": "integer", "minimum": 1},
-                    "max_guaranty_usd": {"type": ["string", "number"]},
-                    "max_guaranty_usd_micro": {"type": "integer", "minimum": -2},
-                    "from_account_id": {"type": "integer", "minimum": 1},
-                    "to_account_id": {"type": "integer", "minimum": 1},
-                    "asset_id": {"type": "integer", "minimum": 0, "default": 0},
-                    "amount_usd": {"type": ["string", "number"]},
-                    "amount_base": {"type": ["string", "number"]},
-                    "amount": {"type": "integer", "minimum": 1},
+                    "action": {
+                        "type": "string",
+                        "enum": ["link", "unlink", "transfer"],
+                        "description": "Prime operation: 'link' (set sub-account guaranty cap), 'unlink' (remove link via sentinel -2), or 'transfer' (0-bps internal transfer).",
+                    },
+                    "master_account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Prime master account ID (>= 1) for 'link' or 'unlink'; defaults to session account_id when omitted.",
+                    },
+                    "sub_account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Target Prime sub-account ID (>= 1) to link to or unlink from master_account_id.",
+                    },
+                    "max_guaranty_usd": {
+                        "type": ["string", "number"],
+                        "description": "Maximum master cross-margin guaranty cap in exact USD (e.g. '5000.00'; '0' = unlimited when notional cap is off); mutually exclusive with max_guaranty_usd_micro.",
+                    },
+                    "max_guaranty_usd_micro": {
+                        "type": "integer",
+                        "minimum": -2,
+                        "description": "Master guaranty cap in integer micro-USD (1 micro = $1e-6, 0 = unlimited when permitted, -2 = unlink sentinel); mutually exclusive with max_guaranty_usd.",
+                    },
+                    "from_account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Source account ID (>= 1) debited during action='transfer'; defaults to session account_id when omitted.",
+                    },
+                    "to_account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Destination linked account ID (>= 1) credited during action='transfer'.",
+                    },
+                    "asset_id": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Collateral asset ID for action='transfer' (0 = USD collateral, >= 1 = Spot base asset ID).",
+                    },
+                    "amount_usd": {
+                        "type": ["string", "number"],
+                        "description": "Exact USD transfer amount as decimal string or number (e.g. '250.00', requires asset_id=0); mutually exclusive with amount and amount_base.",
+                    },
+                    "amount_base": {
+                        "type": ["string", "number"],
+                        "description": "Exact Spot base-asset transfer quantity (e.g. '0.2500', multiple of 1e-4, requires asset_id > 0); mutually exclusive with amount and amount_usd.",
+                    },
+                    "amount": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Raw fixed-point transfer quantity: micro-USD (1 micro = $1e-6) when asset_id=0, or lots (1 lot = 1e-4 base) when asset_id > 0; mutually exclusive with amount_usd/amount_base.",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_bind_builder",
-            "description": "Bind a trader account to a Builder / Order-Flow Router account and protocol cut share (0..5000 bps).",
+            "description": (
+                "Bind a trader account to a Builder / Order-Flow Router account and configure its protocol taker-fee share "
+                "(0..5000 bps) via POST /account/builder. Mutates fee-routing metadata (locked when operator "
+                "--default-builder-account policy is set); use arena_manage_prime_subaccount instead for Prime margin linking."
+            ),
             "inputSchema": {
                 "type": "object",
                 "required": ["builder_account_id", "builder_fee_share_bps"],
                 "properties": {
-                    "trader_account_id": {"type": "integer", "minimum": 1},
-                    "builder_account_id": {"type": "integer", "minimum": 0},
-                    "builder_fee_share_bps": {"type": "integer", "minimum": 0, "maximum": 5000},
+                    "trader_account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Trader account ID (>= 1) binding the builder code; defaults to session account_id when omitted.",
+                    },
+                    "builder_account_id": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Builder / router recipient account ID (0 = unbind builder code, >= 1 = active builder account).",
+                    },
+                    "builder_fee_share_bps": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 5000,
+                        "description": "Builder share of protocol taker fees in basis points (0..5000 bps, where 100 bps = 1.00% and 0 clears fee share).",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_place_order",
-            "description": "Submit a limit/market/pegged/IOC/FOK/PostOnly/reduce-only order using exact USD/base or fixed-point tick/lot units over HTTP or 64B TCP wire.",
+            "description": (
+                "Submit a live single-leg limit, market, pegged, iceberg, dark-midpoint, or reduce-only order over HTTP POST /order "
+                "or 64-byte TCP wire. Mutates L3 book, margin locks, and WAL state; call arena_preview_order first for a "
+                "zero-mutation dry run, arena_replace_two_sided_quote for atomic bid+ask market-making, or "
+                "arena_execute_atomic_basket for multi-leg spreads. Provide mutually exclusive market (`symbol` vs `market_id`), "
+                "price (`price_usd` vs `price_ticks`), and size (`amount_base` vs `qty_lots`) fields."
+            ),
             "inputSchema": {
                 "type": "object",
                 "required": ["side"],
                 "properties": {
-                    "account_id": {"type": "integer", "minimum": 1},
-                    "symbol": {"type": "string"},
-                    "market_id": {"type": "integer", "minimum": 1},
-                    "side": {"type": "string", "enum": ["buy", "sell", "bid", "ask"]},
-                    "price_usd": {"type": ["string", "number"]},
-                    "price_ticks": {"type": "integer"},
-                    "amount_base": {"type": ["string", "number"]},
-                    "qty_lots": {"type": "integer", "minimum": 1},
-                    "tif": {"type": "string", "enum": ["gtc", "ioc", "fok", "post_only"], "default": "gtc"},
-                    "stp": {"type": "string", "enum": ["cancel_resting", "cancel_incoming", "cancel_both", "decrement_and_cancel", "none"], "default": "cancel_resting"},
-                    "is_market": {"type": "boolean", "default": False},
-                    "reduce_only": {"type": "boolean", "default": False},
-                    "margin_spot": {"type": "boolean", "default": False},
-                    "post_only_slide": {"type": "boolean", "default": False},
-                    "primary_peg": {"type": "boolean", "default": False},
-                    "midpoint_peg": {"type": "boolean", "default": False},
-                    "mark_peg": {"type": "boolean", "default": False},
-                    "trailing_peg": {"type": "boolean", "default": False},
-                    "dark_midpoint": {"type": "boolean", "default": False},
-                    "oco_linked": {"type": "boolean", "default": False},
-                    "stp_decrement_and_cancel": {"type": "boolean", "default": False},
-                    "client_tag": {"type": "integer", "minimum": 0, "default": 0},
-                    "min_qty_lots": {"type": "integer", "minimum": 0, "default": 0},
-                    "display_qty_lots": {"type": "integer", "minimum": 0, "default": 0},
-                    "auto_skew_ticks": {"type": "integer", "minimum": 0, "maximum": 500, "default": 0},
-                    "auto_flip_ticks": {"type": "integer", "minimum": 0, "maximum": 500, "default": 0},
-                    "peg_offset_ticks": {"type": "integer", "minimum": -500, "maximum": 500, "default": 0},
-                    "max_lifetime_wal_seqs": {"type": "integer", "minimum": 0, "maximum": 65535, "default": 0},
-                    "jit_elastic_mult": {"type": "integer", "minimum": 0, "maximum": 50, "default": 0},
-                    "priority_fee_ppm": {"type": "integer", "minimum": 0, "maximum": 50000, "default": 0},
-                    "use_binary_wire": {"type": "boolean", "default": False},
+                    "account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Trading account ID (>= 1); defaults to the authenticated session account_id when omitted.",
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Unified or native market symbol (e.g. 'BTC/USD:USD', 'BTC/USD', or 'BTC-USD-PERP'); mutually exclusive with market_id.",
+                    },
+                    "market_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Numeric Arena market identifier (>= 1); mutually exclusive with symbol.",
+                    },
+                    "side": {
+                        "type": "string",
+                        "enum": ["buy", "sell", "bid", "ask"],
+                        "description": "Order side: 'buy'/'bid' (long/buy) or 'sell'/'ask' (short/sell).",
+                    },
+                    "price_usd": {
+                        "type": ["string", "number"],
+                        "description": "Exact limit price in USD decimal string or number (e.g. '50000.00', exact multiple of $0.01); mutually exclusive with price_ticks (optional when is_market=true or pegged).",
+                    },
+                    "price_ticks": {
+                        "type": "integer",
+                        "description": "Limit price in fixed-point integer ticks (1 tick = $0.01; 0 allowed for market/pegged orders; SpreadBook par = 1000000); mutually exclusive with price_usd.",
+                    },
+                    "amount_base": {
+                        "type": ["string", "number"],
+                        "description": "Order size in exact base-asset decimal string or number (e.g. '0.1000', exact multiple of 0.0001); mutually exclusive with qty_lots.",
+                    },
+                    "qty_lots": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Order size in fixed-point integer lots (1 lot = 1e-4 base unit, minimum 1); mutually exclusive with amount_base.",
+                    },
+                    "tif": {
+                        "type": "string",
+                        "enum": ["gtc", "ioc", "fok", "post_only"],
+                        "default": "gtc",
+                        "description": "Time-in-force: 'gtc' (Good-Til-Cancelled), 'ioc' (Immediate-Or-Cancel), 'fok' (Fill-Or-Kill), or 'post_only' (maker-only).",
+                    },
+                    "stp": {
+                        "type": "string",
+                        "enum": ["cancel_resting", "cancel_incoming", "cancel_both", "decrement_and_cancel", "none"],
+                        "default": "cancel_resting",
+                        "description": "Self-Trade Prevention mode applied if this order crosses resting orders from the same account.",
+                    },
+                    "is_market": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, submits an immediate market sweep order (defaults tif to 'ioc' and allows 0 limit price).",
+                    },
+                    "reduce_only": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, strictly reduces an existing open position and never increases directional exposure.",
+                    },
+                    "margin_spot": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true on a Spot market, enables cross-margined Spot borrowing/collateralization under Eigen-SPAN.",
+                    },
+                    "post_only_slide": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, slides a crossing maker order 1 tick passive of the opposing BBO instead of rejecting.",
+                    },
+                    "primary_peg": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, dynamically pegs resting order price to the same-side BBO plus peg_offset_ticks.",
+                    },
+                    "midpoint_peg": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, dynamically pegs resting order price to the BBO midpoint plus peg_offset_ticks.",
+                    },
+                    "mark_peg": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, dynamically pegs resting order price to the oracle/index mark price plus peg_offset_ticks.",
+                    },
+                    "trailing_peg": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, ratchets the pegged order one-way as market price moves favorably by peg_offset_ticks.",
+                    },
+                    "dark_midpoint": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, rests non-displayed at the BBO midpoint for zero pre-trade market impact.",
+                    },
+                    "oco_linked": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, links this order in a One-Cancels-the-Other bracket with orders sharing client_tag.",
+                    },
+                    "stp_decrement_and_cancel": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, decrements the larger self-crossing order by the smaller quantity and cancels the smaller order.",
+                    },
+                    "client_tag": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Optional unsigned strategy/group tag (0 = untagged) used for OCO linking and tag-filtered batch cancels.",
+                    },
+                    "min_qty_lots": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Minimum acceptable immediate fill quantity in integer lots (1 lot = 1e-4 base, 0 = no minimum).",
+                    },
+                    "display_qty_lots": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Visible iceberg clip size in integer lots (1 lot = 1e-4 base, 0 = display full order size unless dark_midpoint=true).",
+                    },
+                    "auto_skew_ticks": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 500,
+                        "default": 0,
+                        "description": "Automatic inventory-skew price adjustment in integer ticks (0..500, 1 tick = $0.01, 0 = disabled).",
+                    },
+                    "auto_flip_ticks": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 500,
+                        "default": 0,
+                        "description": "Automatic passive counter-order flip distance in integer ticks after fill (0..500, 1 tick = $0.01, 0 = disabled).",
+                    },
+                    "peg_offset_ticks": {
+                        "type": "integer",
+                        "minimum": -500,
+                        "maximum": 500,
+                        "default": 0,
+                        "description": "Signed tick offset (-500..500, 1 tick = $0.01) added to the reference price when a peg flag is enabled.",
+                    },
+                    "max_lifetime_wal_seqs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 65535,
+                        "default": 0,
+                        "description": "Good-Til-Sequence auto-expiry lifetime in WAL sequence increments (0..65535, 0 = no sequence expiry).",
+                    },
+                    "jit_elastic_mult": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 50,
+                        "default": 0,
+                        "description": "Elastic liquidity / dynamic iceberg reload multiplier (0..50; >= 2 activates elastic depth/reload, 0 or 1 = standard).",
+                    },
+                    "priority_fee_ppm": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 50000,
+                        "default": 0,
+                        "description": "Optional priority fee bid in parts-per-million of notional (0..50000 ppm, where 100 ppm = 1 bps; 0 = none).",
+                    },
+                    "use_binary_wire": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true and --tcp-port > 0 is configured, dispatches via 64-byte TCP ArenaWire with automatic HTTP REST fallback.",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_replace_two_sided_quote",
-            "description": "Atomically replace both resting Bid and Ask quotes on a market via HTTP POST /quote or 64-byte TCP TwoSidedQuoteReplace.",
+            "description": (
+                "Atomically cancel and replace both resting Bid and Ask maker quotes on a single market in 1 engine step via "
+                "POST /quote or 64-byte TCP TwoSidedQuoteReplace (`0xC`). Mutates resting maker quotes; prefer this over two "
+                "separate arena_place_order calls when market-making, or use arena_modify_order to amend a single order_id. "
+                "Provide mutually exclusive market (`symbol` vs `market_id`), bid/ask price (`*_price_usd` vs `*_price_ticks`), "
+                "and bid/ask size (`*_amount_base` vs `*_qty_lots`) fields."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "account_id": {"type": "integer", "minimum": 1},
-                    "symbol": {"type": "string"},
-                    "market_id": {"type": "integer", "minimum": 1},
-                    "bid_price_usd": {"type": ["string", "number"]},
-                    "bid_price_ticks": {"type": "integer"},
-                    "bid_amount_base": {"type": ["string", "number"]},
-                    "bid_qty_lots": {"type": "integer", "minimum": 0},
-                    "ask_price_usd": {"type": ["string", "number"]},
-                    "ask_price_ticks": {"type": "integer"},
-                    "ask_amount_base": {"type": ["string", "number"]},
-                    "ask_qty_lots": {"type": "integer", "minimum": 0},
-                    "tif": {"type": "string", "enum": ["gtc", "post_only", "postonly", "ioc", "fok"], "default": "gtc"},
-                    "stp": {"type": "string", "enum": ["cancel_resting", "cancel_incoming", "cancel_aggressor", "cancel_both", "none"], "default": "cancel_resting"},
-                    "post_only_slide": {"type": "boolean", "default": False},
-                    "margin_spot": {"type": "boolean", "default": False},
-                    "client_tag": {"type": "integer", "minimum": 0, "default": 0},
-                    "auto_skew_ticks": {"type": "integer", "minimum": 0, "maximum": 500, "default": 0},
-                    "auto_flip_ticks": {"type": "integer", "minimum": 0, "maximum": 500, "default": 0},
-                    "quote_peg_mode": {"type": "integer", "minimum": 0, "maximum": 4, "default": 0},
-                    "peg_offset_ticks": {"type": "integer", "minimum": -500, "maximum": 500, "default": 0},
-                    "oco_linked": {"type": "boolean", "default": False},
-                    "max_lifetime_wal_seqs": {"type": "integer", "minimum": 0, "maximum": 65535, "default": 0},
-                    "jit_elastic_mult": {"type": "integer", "minimum": 0, "maximum": 50, "default": 0},
-                    "ladder_by_tag": {"type": "boolean", "default": False},
-                    "use_binary_wire": {"type": "boolean", "default": False},
+                    "account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Market-maker account ID (>= 1); defaults to the authenticated session account_id when omitted.",
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Unified or native market symbol (e.g. 'BTC/USD:USD' or 'BTC-USD-PERP'); mutually exclusive with market_id.",
+                    },
+                    "market_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Numeric Arena market identifier (>= 1); mutually exclusive with symbol.",
+                    },
+                    "bid_price_usd": {
+                        "type": ["string", "number"],
+                        "description": "Exact Bid quote price in USD decimal string or number (e.g. '49995.00', multiple of $0.01); mutually exclusive with bid_price_ticks.",
+                    },
+                    "bid_price_ticks": {
+                        "type": "integer",
+                        "description": "Bid quote price in integer ticks (1 tick = $0.01; 0 allowed when quote_peg_mode > 0 or canceling bid side); mutually exclusive with bid_price_usd.",
+                    },
+                    "bid_amount_base": {
+                        "type": ["string", "number"],
+                        "description": "Bid quote size in exact base units (e.g. '0.1000', multiple of 1e-4; '0' cancels resting bid only); mutually exclusive with bid_qty_lots.",
+                    },
+                    "bid_qty_lots": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Bid quote size in integer lots (1 lot = 1e-4 base, 0 = cancel resting bid side without posting a new bid); mutually exclusive with bid_amount_base.",
+                    },
+                    "ask_price_usd": {
+                        "type": ["string", "number"],
+                        "description": "Exact Ask quote price in USD decimal string or number (e.g. '50005.00', multiple of $0.01); mutually exclusive with ask_price_ticks.",
+                    },
+                    "ask_price_ticks": {
+                        "type": "integer",
+                        "description": "Ask quote price in integer ticks (1 tick = $0.01; 0 allowed when quote_peg_mode > 0 or canceling ask side); mutually exclusive with ask_price_usd.",
+                    },
+                    "ask_amount_base": {
+                        "type": ["string", "number"],
+                        "description": "Ask quote size in exact base units (e.g. '0.1000', multiple of 1e-4; '0' cancels resting ask only); mutually exclusive with ask_qty_lots.",
+                    },
+                    "ask_qty_lots": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Ask quote size in integer lots (1 lot = 1e-4 base, 0 = cancel resting ask side without posting a new ask); mutually exclusive with ask_amount_base.",
+                    },
+                    "tif": {
+                        "type": "string",
+                        "enum": ["gtc", "post_only", "postonly", "ioc", "fok"],
+                        "default": "gtc",
+                        "description": "Time-in-force applied to both Bid and Ask legs (use 'post_only' for strict maker-only quoting).",
+                    },
+                    "stp": {
+                        "type": "string",
+                        "enum": ["cancel_resting", "cancel_incoming", "cancel_aggressor", "cancel_both", "none"],
+                        "default": "cancel_resting",
+                        "description": "Self-Trade Prevention policy applied to both Bid and Ask quote legs.",
+                    },
+                    "post_only_slide": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, slides any crossing quote leg 1 tick passive of the opposing BBO instead of rejecting.",
+                    },
+                    "margin_spot": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true on a Spot market, enables cross-margined Spot quoting under Eigen-SPAN.",
+                    },
+                    "client_tag": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Unsigned quote-slot tag (0 = default market quote slot; combine with ladder_by_tag=true for multi-rung quote ladders).",
+                    },
+                    "auto_skew_ticks": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 500,
+                        "default": 0,
+                        "description": "Inventory-driven price skew step in integer ticks (0..500, 1 tick = $0.01, 0 = disabled).",
+                    },
+                    "auto_flip_ticks": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 500,
+                        "default": 0,
+                        "description": "Automatic counter-side re-quote flip distance in ticks upon fill (0..500, 1 tick = $0.01, 0 = disabled).",
+                    },
+                    "quote_peg_mode": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 4,
+                        "default": 0,
+                        "description": "Native quote pegging mode: 0 = fixed limit prices, 1 = primary BBO peg, 2 = midpoint peg, 3 = mark-price peg, 4 = trailing peg.",
+                    },
+                    "peg_offset_ticks": {
+                        "type": "integer",
+                        "minimum": -500,
+                        "maximum": 500,
+                        "default": 0,
+                        "description": "Signed half-spread or reference offset in integer ticks (-500..500, 1 tick = $0.01) when quote_peg_mode > 0.",
+                    },
+                    "oco_linked": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, links Bid and Ask legs as One-Cancels-the-Other so filling one cancels the opposite leg.",
+                    },
+                    "max_lifetime_wal_seqs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 65535,
+                        "default": 0,
+                        "description": "Good-Til-Sequence auto-expiry lifetime in WAL sequence increments (0..65535, 0 = no sequence expiry).",
+                    },
+                    "jit_elastic_mult": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 50,
+                        "default": 0,
+                        "description": "Elastic maker liquidity multiplier (0..50; >= 2 enables elastic depth scaling, 0 or 1 = standard).",
+                    },
+                    "ladder_by_tag": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, replaces only resting quotes matching client_tag so multiple tagged quote rungs coexist.",
+                    },
+                    "use_binary_wire": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true and --tcp-port > 0 is configured, dispatches via 64-byte TCP TwoSidedQuoteReplace with HTTP fallback.",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_modify_order",
-            "description": "Modify an existing resting order price and/or quantity with optional FIFO keep_priority.",
+            "description": (
+                "Modify an existing resting order's limit price and/or quantity in-place by order_id with optional FIFO queue "
+                "priority preservation. Mutates a single open order; use arena_replace_two_sided_quote for paired bid+ask updates "
+                "or arena_cancel_orders to cancel. Provide mutually exclusive market (`symbol` vs `market_id`), price (`price_usd` "
+                "vs `price_ticks`), and size (`amount_base` vs `qty_lots`) fields."
+            ),
             "inputSchema": {
                 "type": "object",
                 "required": ["order_id"],
                 "properties": {
-                    "account_id": {"type": "integer", "minimum": 1},
-                    "symbol": {"type": "string"},
-                    "market_id": {"type": "integer", "minimum": 1},
-                    "order_id": {"type": "integer", "minimum": 1},
-                    "price_usd": {"type": ["string", "number"]},
-                    "price_ticks": {"type": "integer"},
-                    "amount_base": {"type": ["string", "number"]},
-                    "qty_lots": {"type": "integer", "minimum": 1},
-                    "keep_priority": {"type": "boolean", "default": False},
-                    "use_binary_wire": {"type": "boolean", "default": False},
+                    "account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Account ID (>= 1) owning the open order; defaults to the authenticated session account_id when omitted.",
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Unified or native market symbol (e.g. 'BTC/USD:USD'); mutually exclusive with market_id.",
+                    },
+                    "market_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Numeric Arena market identifier (>= 1); mutually exclusive with symbol.",
+                    },
+                    "order_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Unique positive integer order_id of the currently resting open order to modify.",
+                    },
+                    "price_usd": {
+                        "type": ["string", "number"],
+                        "description": "New exact limit price in USD decimal string or number (e.g. '50100.00', multiple of $0.01); mutually exclusive with price_ticks.",
+                    },
+                    "price_ticks": {
+                        "type": "integer",
+                        "description": "New limit price in fixed-point integer ticks (1 tick = $0.01); mutually exclusive with price_usd.",
+                    },
+                    "amount_base": {
+                        "type": ["string", "number"],
+                        "description": "New total order quantity in exact base units (e.g. '0.2000', multiple of 1e-4); mutually exclusive with qty_lots.",
+                    },
+                    "qty_lots": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "New total order quantity in fixed-point integer lots (1 lot = 1e-4 base, minimum 1); mutually exclusive with amount_base.",
+                    },
+                    "keep_priority": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, retains existing L3 FIFO queue priority when downsizing quantity at an unchanged price.",
+                    },
+                    "use_binary_wire": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true and --tcp-port > 0 is configured, sends a 64-byte TCP ModifyOrder frame with HTTP fallback.",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_cancel_orders",
-            "description": "Cancel a specific resting order by order_id or batch-cancel orders by market, side, client_tag_filter, or market_bitmask.",
+            "description": (
+                "Cancel one specific resting order by order_id or batch-cancel resting orders across all or selected markets "
+                "filtered by side, client_tag_filter, or market_bitmask. Idempotently removes open orders without closing filled "
+                "positions; use arena_portfolio_delta_hedge or a reduce_only arena_place_order to close open positions. "
+                "Provide either `symbol` or `market_id` when scoping to a single market."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "account_id": {"type": "integer", "minimum": 1},
-                    "symbol": {"type": "string"},
-                    "market_id": {"type": "integer", "minimum": 0, "default": 0},
-                    "order_id": {"type": "integer", "minimum": 0, "default": 0},
-                    "cancel_all": {"type": "boolean", "default": False},
-                    "side": {"type": "string", "enum": ["", "bid", "ask", "buy", "sell"], "default": ""},
-                    "client_tag_filter": {"type": "integer", "minimum": 0, "default": 0},
-                    "market_bitmask": {"type": "integer", "minimum": 0, "default": 0},
-                    "use_binary_wire": {"type": "boolean", "default": False},
+                    "account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Account ID (>= 1) whose resting orders will be cancelled; defaults to session account_id when omitted.",
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Optional market symbol scope (required when cancelling a single order_id without market_id); mutually exclusive with market_id.",
+                    },
+                    "market_id": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Market ID scope (0 = all markets during batch cancel_all; >= 1 = specific market); mutually exclusive with symbol.",
+                    },
+                    "order_id": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Specific resting order ID to cancel (> 0 cancels single order; 0 triggers filtered batch cancel_all).",
+                    },
+                    "cancel_all": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true (or when order_id == 0), executes batch cancel_all across matching market/side/tag filters.",
+                    },
+                    "side": {
+                        "type": "string",
+                        "enum": ["", "bid", "ask", "buy", "sell"],
+                        "default": "",
+                        "description": "Optional side filter for batch cancel_all: '' (both sides), 'buy'/'bid' (bids only), or 'sell'/'ask' (asks only).",
+                    },
+                    "client_tag_filter": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Optional strategy client_tag filter for batch cancel_all (0 = all tags, > 0 = cancel only matching client_tag).",
+                    },
+                    "market_bitmask": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Optional 64-bit bitmask of market IDs for multi-market batch cancel_all (0 = no bitmask filter).",
+                    },
+                    "use_binary_wire": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true and --tcp-port > 0 is configured, dispatches CancelOrder/CancelAll over 64-byte TCP wire with HTTP fallback.",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_execute_atomic_basket",
-            "description": "Execute an all-or-nothing 2..4-leg atomic cross-market basket / spread trade via POST /basket.",
+            "description": (
+                "Execute an all-or-nothing 2..4-leg cross-market basket, basis, or butterfly spread trade in a single atomic "
+                "commit via POST /basket (reverts all legs if any leg fails price, liquidity, or Eigen-SPAN margin checks). "
+                "Use this for multi-leg relative-value execution, whereas arena_place_order places a single-leg order and "
+                "arena_portfolio_delta_hedge auto-computes residual portfolio delta hedges. Within each leg, provide mutually "
+                "exclusive market (`symbol` vs `market_id`), price (`price_usd` vs `price_ticks`), and size (`amount_base` vs `qty_lots`) fields."
+            ),
             "inputSchema": {
                 "type": "object",
                 "required": ["legs"],
                 "properties": {
-                    "account_id": {"type": "integer", "minimum": 1},
-                    "stp": {"type": "string", "enum": ["cancel_resting", "cancel_incoming", "cancel_both", "none"], "default": "cancel_resting"},
-                    "margin_spot": {"type": "boolean", "default": False},
-                    "client_tag": {"type": "integer", "minimum": 0, "default": 0},
-                    "express_surplus_bid_bps": {"type": "integer", "minimum": 0, "maximum": 5000, "default": 0},
+                    "account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Trading account ID (>= 1) executing the atomic basket; defaults to session account_id when omitted.",
+                    },
+                    "stp": {
+                        "type": "string",
+                        "enum": ["cancel_resting", "cancel_incoming", "cancel_both", "none"],
+                        "default": "cancel_resting",
+                        "description": "Self-Trade Prevention policy applied across all basket legs.",
+                    },
+                    "margin_spot": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Default cross-margined Spot flag applied to Spot legs unless overridden per leg.",
+                    },
+                    "client_tag": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Optional unsigned strategy/correlation tag (0 = untagged) recorded on basket fills.",
+                    },
+                    "express_surplus_bid_bps": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 5000,
+                        "default": 0,
+                        "description": "Optional priority auction share of positive basket surplus bid to protocol in basis points (0..5000 bps, 0 = none).",
+                    },
                     "legs": {
                         "type": "array",
                         "minItems": 2,
                         "maxItems": 4,
+                        "description": "Ordered array of 2 to 4 individual market legs executed atomically (all legs fill within limits or none execute).",
                         "items": {
                             "type": "object",
                             "required": ["side"],
                             "properties": {
-                                "symbol": {"type": "string"},
-                                "market_id": {"type": "integer", "minimum": 1},
-                                "side": {"type": "string", "enum": ["buy", "sell", "bid", "ask"]},
-                                "price_usd": {"type": ["string", "number"]},
-                                "price_ticks": {"type": "integer"},
-                                "amount_base": {"type": ["string", "number"]},
-                                "qty_lots": {"type": "integer", "minimum": 1},
-                                "is_market": {"type": "boolean", "default": False},
-                                "reduce_only": {"type": "boolean", "default": False},
-                                "margin_spot": {"type": "boolean", "default": False},
+                                "symbol": {
+                                    "type": "string",
+                                    "description": "Leg unified or native market symbol (e.g. 'BTC/USD:USD' or 'BTC/USD'); mutually exclusive with leg market_id.",
+                                },
+                                "market_id": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "description": "Leg numeric Arena market identifier (>= 1); mutually exclusive with leg symbol.",
+                                },
+                                "side": {
+                                    "type": "string",
+                                    "enum": ["buy", "sell", "bid", "ask"],
+                                    "description": "Leg execution side: 'buy'/'bid' or 'sell'/'ask'.",
+                                },
+                                "price_usd": {
+                                    "type": ["string", "number"],
+                                    "description": "Leg worst-case limit price in exact USD (e.g. '50000.00', multiple of $0.01); mutually exclusive with leg price_ticks.",
+                                },
+                                "price_ticks": {
+                                    "type": "integer",
+                                    "description": "Leg worst-case limit price in integer ticks (1 tick = $0.01; 0 allowed when is_market=true); mutually exclusive with leg price_usd.",
+                                },
+                                "amount_base": {
+                                    "type": ["string", "number"],
+                                    "description": "Leg quantity in exact base units (e.g. '0.0500', multiple of 1e-4); mutually exclusive with leg qty_lots.",
+                                },
+                                "qty_lots": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "description": "Leg quantity in fixed-point integer lots (1 lot = 1e-4 base, minimum 1); mutually exclusive with leg amount_base.",
+                                },
+                                "is_market": {
+                                    "type": "boolean",
+                                    "default": False,
+                                    "description": "When true, sweeps resting book liquidity on this leg without a strict limit price.",
+                                },
+                                "reduce_only": {
+                                    "type": "boolean",
+                                    "default": False,
+                                    "description": "When true, constrains this leg to strictly reduce an existing open position.",
+                                },
+                                "margin_spot": {
+                                    "type": "boolean",
+                                    "default": False,
+                                    "description": "When true on a Spot leg, enables cross-margined Spot execution under Eigen-SPAN.",
+                                },
                             },
                             "additionalProperties": False,
                         },
@@ -691,164 +1394,549 @@ def _tool_specs() -> List[Dict[str, Any]]:
         },
         {
             "name": "arena_portfolio_delta_hedge",
-            "description": "Execute a 1-frame Jacobian residual delta-neutralizing hedge via POST /auto_delta_hedge.",
+            "description": (
+                "Compute the account's analytic Jacobian net asset delta across Spot, LinearPerpetual, and FormulaPerpetual "
+                "positions and execute a 1-frame delta-neutralizing IOC hedge via POST /auto_delta_hedge. Mutates positions "
+                "to flatten residual directional delta; use this for automated portfolio hedging, whereas "
+                "arena_execute_atomic_basket executes explicit caller-specified multi-leg trade quantities."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "account_id": {"type": "integer", "minimum": 1},
-                    "base_asset_id": {"type": "integer", "minimum": 0, "default": 0},
-                    "preferred_market_id": {"type": "integer", "minimum": 0, "default": 0},
-                    "max_slippage_bps": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 200},
-                    "max_qty_lots": {"type": "integer", "minimum": 0, "default": 0},
-                    "margin_spot": {"type": "boolean", "default": False},
+                    "account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Account ID (>= 1) whose residual portfolio delta will be hedged; defaults to session account_id when omitted.",
+                    },
+                    "base_asset_id": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Target underlying base asset ID to hedge (0 = hedge all base assets with non-zero net delta, >= 1 = single asset).",
+                    },
+                    "preferred_market_id": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Optional preferred Arena market ID for routing the hedge (0 = engine auto-selects deepest liquid Spot/Perp venue).",
+                    },
+                    "max_slippage_bps": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5000,
+                        "default": 200,
+                        "description": "Maximum acceptable execution slippage from reference mark/BBO in basis points (1..5000 bps, default 200 = 2.00%).",
+                    },
+                    "max_qty_lots": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Maximum hedge size cap per base asset in integer lots (1 lot = 1e-4 base, 0 = hedge full residual delta).",
+                    },
+                    "margin_spot": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, permits cross-margined Spot borrowing/collateralization if the hedge routes through a Spot market.",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_request_withdrawal",
-            "description": "Request an off-chain debit + operator-signed ARENA_WITHDRAW_V1_4 voucher (blocked unless --allow-withdrawals is explicitly enabled).",
+            "description": (
+                "Debit free off-chain collateral and issue an operator-signed ARENA_WITHDRAW_V1_4 voucher for L2 Clearinghouse "
+                "claim via POST /withdraw (blocked unless --allow-withdrawals is explicitly enabled). Destructively debits "
+                "off-chain balance into an on-chain claimable voucher; use arena_manage_prime_subaccount (`action='transfer'`) "
+                "for 0-bps internal transfers, or arena_get_withdrawals_and_escape_proof to inspect existing vouchers. "
+                "Provide mutually exclusive amount fields (`amount_usd`, `amount_base`, or raw `amount`)."
+            ),
             "inputSchema": {
                 "type": "object",
                 "required": ["recipient_eth_address"],
                 "properties": {
-                    "account_id": {"type": "integer", "minimum": 1},
-                    "asset_id": {"type": "integer", "minimum": 0, "default": 0},
-                    "amount_usd": {"type": ["string", "number"]},
-                    "amount_base": {"type": ["string", "number"]},
-                    "amount": {"type": "integer", "minimum": 1},
-                    "recipient_eth_address": {"type": "string"},
+                    "account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Source Arena account ID (>= 1) to debit; defaults to session account_id when omitted.",
+                    },
+                    "asset_id": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Collateral asset ID to withdraw (0 = USD settlement collateral, >= 1 = Spot base asset ID).",
+                    },
+                    "amount_usd": {
+                        "type": ["string", "number"],
+                        "description": "Exact USD withdrawal amount as decimal string or number (e.g. '100.00', requires asset_id=0); mutually exclusive with amount and amount_base.",
+                    },
+                    "amount_base": {
+                        "type": ["string", "number"],
+                        "description": "Exact Spot base-asset withdrawal quantity (e.g. '0.5000', multiple of 1e-4, requires asset_id > 0); mutually exclusive with amount and amount_usd.",
+                    },
+                    "amount": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Raw fixed-point withdrawal quantity: micro-USD (1 micro = $1e-6) when asset_id=0, or lots (1 lot = 1e-4 base) when asset_id > 0; mutually exclusive with amount_usd/amount_base.",
+                    },
+                    "recipient_eth_address": {
+                        "type": "string",
+                        "description": "Destination 0x-prefixed 20-byte Ethereum wallet address authorized to claim the voucher on Clearinghouse.",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_subscribe_express_port",
-            "description": "Purchase or extend a Native Colocation Express Port lease (epochs) for priority wire tie-break and max Core 1 ingress batching.",
+            "description": (
+                "Purchase or extend a Native Colocation Express Port lease (in epochs) for priority wire tie-breaking and "
+                "maximum Core 1 ingress batching via POST /account/express_port or 64-byte TCP wire. Debits free USD collateral "
+                "for the standing epoch lease; pass `priority_fee_ppm` on arena_place_order instead when bidding priority on a "
+                "single order without a standing lease."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "account_id": {"type": "integer", "minimum": 1},
-                    "duration_epochs": {"type": "integer", "minimum": 1, "maximum": 1051200, "default": 1},
-                    "max_fee_usd_micro": {"type": "integer", "minimum": 0, "default": 0},
-                    "use_binary_wire": {"type": "boolean", "default": False},
+                    "account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Account ID (>= 1) purchasing or extending the Express Port lease; defaults to session account_id when omitted.",
+                    },
+                    "duration_epochs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1051200,
+                        "default": 1,
+                        "description": "Number of Express Port epochs to purchase or append to the active lease (1..1051200, default 1).",
+                    },
+                    "max_fee_usd_micro": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Maximum acceptable total lease fee in integer micro-USD (1 micro = $1e-6, 0 = accept protocol epoch rate up to notional cap).",
+                    },
+                    "use_binary_wire": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true and --tcp-port > 0 is configured, submits the Express Port subscription over 64-byte TCP wire with HTTP fallback.",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_preview_order",
-            "description": "Stateless dry-run order simulation via POST /order/preview (zero WAL, L3 book, or balance mutation). Returns estimated fills, resting lots, net fee/rebate, and pre/post Eigen-SPAN IMR/MMR/free margin.",
+            "description": (
+                "Run a stateless, zero-mutation order simulation via POST /order/preview (never mutates WAL, L3 book, or balances; "
+                "supports `account_id=0` anonymous zero-key preview as well as authenticated Eigen-SPAN IMR/MMR/free-margin checks). "
+                "Always call this to verify fill price, net fee/rebate, and margin impact before calling arena_place_order to execute live. "
+                "Provide mutually exclusive market (`symbol` vs `market_id`), price (`price_usd`, `price_ticks`, or SpreadBook "
+                "`differential_usd`), and size (`amount_base` vs `qty_lots`) fields."
+            ),
             "inputSchema": {
                 "type": "object",
                 "required": ["side"],
                 "properties": {
-                    "account_id": {"type": "integer", "minimum": 1},
-                    "symbol": {"type": "string"},
-                    "market_id": {"type": "integer", "minimum": 1},
-                    "side": {"type": "string", "enum": ["buy", "sell", "bid", "ask"]},
-                    "price_usd": {"type": ["string", "number"]},
-                    "price_ticks": {"type": "integer"},
-                    "differential_usd": {"type": ["string", "number"]},
-                    "amount_base": {"type": ["string", "number"]},
-                    "qty_lots": {"type": "integer", "minimum": 1},
-                    "tif": {"type": "string", "enum": ["gtc", "ioc", "fok", "post_only"], "default": "gtc"},
-                    "stp": {"type": "string", "enum": ["cancel_resting", "cancel_incoming", "cancel_both", "decrement_and_cancel", "none"], "default": "cancel_resting"},
-                    "is_market": {"type": "boolean", "default": False},
-                    "reduce_only": {"type": "boolean", "default": False},
-                    "margin_spot": {"type": "boolean", "default": False},
-                    "post_only_slide": {"type": "boolean", "default": False},
-                    "primary_peg": {"type": "boolean", "default": False},
-                    "midpoint_peg": {"type": "boolean", "default": False},
-                    "mark_peg": {"type": "boolean", "default": False},
-                    "trailing_peg": {"type": "boolean", "default": False},
-                    "dark_midpoint": {"type": "boolean", "default": False},
-                    "oco_linked": {"type": "boolean", "default": False},
-                    "stp_decrement_and_cancel": {"type": "boolean", "default": False},
-                    "client_tag": {"type": "integer", "minimum": 0, "default": 0},
-                    "min_qty_lots": {"type": "integer", "minimum": 0, "default": 0},
-                    "display_qty_lots": {"type": "integer", "minimum": 0, "default": 0},
-                    "auto_skew_ticks": {"type": "integer", "minimum": 0, "maximum": 500, "default": 0},
-                    "auto_flip_ticks": {"type": "integer", "minimum": 0, "maximum": 500, "default": 0},
-                    "peg_offset_ticks": {"type": "integer", "minimum": -500, "maximum": 500, "default": 0},
-                    "max_lifetime_wal_seqs": {"type": "integer", "minimum": 0, "maximum": 65535, "default": 0},
-                    "jit_elastic_mult": {"type": "integer", "minimum": 0, "maximum": 50, "default": 0},
-                    "priority_fee_ppm": {"type": "integer", "minimum": 0, "maximum": 50000, "default": 0},
+                    "account_id": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Account ID for simulation (0 = anonymous zero-key preview without credentials; >= 1 = simulate against account's live Eigen-SPAN portfolio; defaults to session account or 0 when unauthenticated).",
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Unified or native market symbol (e.g. 'BTC/USD:USD', 'BTC/USD', or 'BTC-USD-PERP'); mutually exclusive with market_id.",
+                    },
+                    "market_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Numeric Arena market identifier (>= 1); mutually exclusive with symbol.",
+                    },
+                    "side": {
+                        "type": "string",
+                        "enum": ["buy", "sell", "bid", "ask"],
+                        "description": "Simulated order direction: 'buy'/'bid' or 'sell'/'ask'.",
+                    },
+                    "price_usd": {
+                        "type": ["string", "number"],
+                        "description": "Simulated limit price in exact USD decimal string or number (e.g. '50000.00', multiple of $0.01); mutually exclusive with price_ticks and differential_usd.",
+                    },
+                    "price_ticks": {
+                        "type": "integer",
+                        "description": "Simulated limit price in fixed-point integer ticks (1 tick = $0.01; 0 allowed for market/pegged orders); mutually exclusive with price_usd and differential_usd.",
+                    },
+                    "differential_usd": {
+                        "type": ["string", "number"],
+                        "description": "Signed USD spread differential relative to $10,000.00 par (e.g. '-5.25') for SpreadBook markets only; mutually exclusive with price_usd and price_ticks.",
+                    },
+                    "amount_base": {
+                        "type": ["string", "number"],
+                        "description": "Simulated order size in exact base units (e.g. '0.1000', multiple of 1e-4); mutually exclusive with qty_lots.",
+                    },
+                    "qty_lots": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Simulated order size in fixed-point integer lots (1 lot = 1e-4 base, minimum 1); mutually exclusive with amount_base.",
+                    },
+                    "tif": {
+                        "type": "string",
+                        "enum": ["gtc", "ioc", "fok", "post_only"],
+                        "default": "gtc",
+                        "description": "Simulated time-in-force policy: 'gtc', 'ioc', 'fok', or 'post_only'.",
+                    },
+                    "stp": {
+                        "type": "string",
+                        "enum": ["cancel_resting", "cancel_incoming", "cancel_both", "decrement_and_cancel", "none"],
+                        "default": "cancel_resting",
+                        "description": "Simulated Self-Trade Prevention mode against same-account resting orders.",
+                    },
+                    "is_market": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, simulates an immediate market order sweep (defaults tif to 'ioc').",
+                    },
+                    "reduce_only": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, simulates a strict position-reducing order.",
+                    },
+                    "margin_spot": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true on a Spot market, simulates cross-margined Spot execution under Eigen-SPAN.",
+                    },
+                    "post_only_slide": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, simulates passive 1-tick BBO sliding if the order would cross resting liquidity.",
+                    },
+                    "primary_peg": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, simulates a primary same-side BBO pegged order plus peg_offset_ticks.",
+                    },
+                    "midpoint_peg": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, simulates a BBO midpoint pegged order plus peg_offset_ticks.",
+                    },
+                    "mark_peg": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, simulates an oracle/index mark-price pegged order plus peg_offset_ticks.",
+                    },
+                    "trailing_peg": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, simulates a one-way ratcheting trailing pegged order.",
+                    },
+                    "dark_midpoint": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, simulates a non-displayed dark-midpoint order.",
+                    },
+                    "oco_linked": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, simulates OCO bracket validation alongside client_tag.",
+                    },
+                    "stp_decrement_and_cancel": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, simulates decrement-and-cancel self-trade prevention.",
+                    },
+                    "client_tag": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Optional unsigned strategy/OCO client tag (0 = untagged).",
+                    },
+                    "min_qty_lots": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Minimum immediate fill quantity in integer lots (1 lot = 1e-4 base, 0 = no minimum).",
+                    },
+                    "display_qty_lots": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Simulated visible iceberg clip size in integer lots (1 lot = 1e-4 base, 0 = full size displayed).",
+                    },
+                    "auto_skew_ticks": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 500,
+                        "default": 0,
+                        "description": "Simulated inventory-skew step in integer ticks (0..500, 1 tick = $0.01, 0 = disabled).",
+                    },
+                    "auto_flip_ticks": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 500,
+                        "default": 0,
+                        "description": "Simulated passive counter-order flip distance in ticks (0..500, 1 tick = $0.01, 0 = disabled).",
+                    },
+                    "peg_offset_ticks": {
+                        "type": "integer",
+                        "minimum": -500,
+                        "maximum": 500,
+                        "default": 0,
+                        "description": "Signed tick offset (-500..500, 1 tick = $0.01) applied to pegged reference price.",
+                    },
+                    "max_lifetime_wal_seqs": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 65535,
+                        "default": 0,
+                        "description": "Simulated Good-Til-Sequence auto-expiry lifetime in WAL sequences (0..65535, 0 = none).",
+                    },
+                    "jit_elastic_mult": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 50,
+                        "default": 0,
+                        "description": "Simulated elastic liquidity / dynamic iceberg reload multiplier (0..50, 0 or 1 = standard).",
+                    },
+                    "priority_fee_ppm": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 50000,
+                        "default": 0,
+                        "description": "Simulated priority fee bid in parts-per-million of notional (0..50000 ppm, 0 = none).",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_flash_arbitrage",
-            "description": "Execute zero-pre-margin intra-tick atomic Flash Arbitrage (mint+sell or buy+burn/redeem) on a Bonding-Curve Spot or BoundedClaim market via POST /flash_arb or 64B TCP wire.",
+            "description": (
+                "Execute an atomic, zero-pre-margin intra-tick Flash Arbitrage (mint+sell or buy+redeem) between an intrinsic "
+                "Bonding-Curve Spot / BoundedClaim payoff and the L3 orderbook via POST /flash_arb or 64-byte TCP wire (reverts "
+                "if net profit < min_profit). Use this for $0-collateral curve/claim dislocations, whereas "
+                "arena_execute_atomic_basket trades margined cross-market spreads and arena_auto_liquidate sweeps underwater "
+                "accounts. Provide mutually exclusive market (`symbol` vs `market_id`), size (`amount_base` vs `qty_lots`), "
+                "limit (`limit_price_usd` vs `limit_price_ticks`), and profit (`min_profit_usd` vs `min_profit_micro`) fields."
+            ),
             "inputSchema": {
                 "type": "object",
                 "required": ["side"],
                 "properties": {
-                    "account_id": {"type": "integer", "minimum": 1},
-                    "symbol": {"type": "string"},
-                    "market_id": {"type": "integer", "minimum": 1},
+                    "account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Arbitrageur account ID (>= 1) credited with realized net USD profit; defaults to session account_id when omitted.",
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Target Bonding-Curve Spot or BoundedClaim market symbol; mutually exclusive with market_id.",
+                    },
+                    "market_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Target numeric Arena market identifier (>= 1); mutually exclusive with symbol.",
+                    },
                     "side": {
                         "type": "string",
                         "enum": ["buy", "sell", "bid", "ask", "mint", "redeem", "mint_and_sell", "buy_and_redeem"],
+                        "description": "Flash arbitrage direction: 'buy'/'bid'/'mint'/'mint_and_sell' or 'sell'/'ask'/'redeem'/'buy_and_redeem'.",
                     },
-                    "amount_base": {"type": ["string", "number"]},
-                    "qty_lots": {"type": "integer", "minimum": 1},
-                    "limit_price_usd": {"type": ["string", "number"]},
-                    "limit_price_ticks": {"type": "integer", "default": 0},
-                    "min_profit_usd": {"type": ["string", "number"]},
-                    "min_profit_micro": {"type": "integer", "default": 0},
-                    "is_market": {"type": "boolean", "default": True},
-                    "stp": {"type": "string", "enum": ["cancel_resting", "cancel_incoming", "cancel_both", "none"], "default": "cancel_resting"},
-                    "express_surplus_bid_bps": {"type": "integer", "minimum": 0, "maximum": 5000, "default": 0},
-                    "use_binary_wire": {"type": "boolean", "default": False},
+                    "amount_base": {
+                        "type": ["string", "number"],
+                        "description": "Flash-arbitrage sweep quantity in exact base units (e.g. '1.0000', multiple of 1e-4); mutually exclusive with qty_lots.",
+                    },
+                    "qty_lots": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Flash-arbitrage sweep quantity in fixed-point integer lots (1 lot = 1e-4 base, minimum 1); mutually exclusive with amount_base.",
+                    },
+                    "limit_price_usd": {
+                        "type": ["string", "number"],
+                        "description": "Optional worst-case book execution limit price in exact USD (e.g. '0.95', multiple of $0.01); mutually exclusive with limit_price_ticks.",
+                    },
+                    "limit_price_ticks": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": "Worst-case book limit price in integer ticks (1 tick = $0.01, 0 = unconstrained when is_market=true); mutually exclusive with limit_price_usd.",
+                    },
+                    "min_profit_usd": {
+                        "type": ["string", "number"],
+                        "description": "Minimum required net realized profit in exact USD (e.g. '0.05'; atomic revert if unmet); mutually exclusive with min_profit_micro.",
+                    },
+                    "min_profit_micro": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": "Minimum required net realized profit in integer micro-USD (1 micro = $1e-6, 0 = break-even floor); mutually exclusive with min_profit_usd.",
+                    },
+                    "is_market": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "When true, sweeps available book depth up to qty_lots subject to the atomic min_profit floor.",
+                    },
+                    "stp": {
+                        "type": "string",
+                        "enum": ["cancel_resting", "cancel_incoming", "cancel_both", "none"],
+                        "default": "cancel_resting",
+                        "description": "Self-Trade Prevention policy when encountering the arbitrageur's own resting orders.",
+                    },
+                    "express_surplus_bid_bps": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 5000,
+                        "default": 0,
+                        "description": "Optional auction bid sharing positive arbitrage surplus with the protocol in basis points (0..5000 bps, 0 = none).",
+                    },
+                    "use_binary_wire": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true and --tcp-port > 0 is configured, dispatches over 64-byte TCP FlashArbitrage wire frame with HTTP fallback.",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_auto_liquidate",
-            "description": "Execute an autonomous zero-capital liquidation & backstop bounty sweep across underwater accounts via POST /auto_liquidate.",
+            "description": (
+                "Execute an autonomous zero-capital liquidation and backstop bounty sweep across underwater accounts (MMR breach) "
+                "via POST /auto_liquidate, optionally offloading seized contracts immediately onto the L3 book. Mutates underwater "
+                "positions and credits liquidator bounty when net bounty >= min_bounty; use arena_flash_arbitrage instead for "
+                "Bonding-Curve / BoundedClaim mint-redeem dislocations. Provide mutually exclusive `min_bounty_usd` vs `min_bounty_micro`."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "liquidator_account_id": {"type": "integer", "minimum": 1},
-                    "market_id": {"type": "integer", "minimum": 0, "default": 0},
-                    "target_account_id": {"type": "integer", "minimum": 0, "default": 0},
-                    "max_lots": {"type": "integer", "minimum": 0, "default": 0},
-                    "min_bounty_usd": {"type": ["string", "number"]},
-                    "min_bounty_micro": {"type": "integer", "default": 0},
-                    "flash_offload_to_book": {"type": "boolean", "default": True},
-                    "stp": {"type": "string", "enum": ["cancel_resting", "cancel_incoming", "cancel_both", "none"], "default": "cancel_resting"},
-                    "hedge_margin_spot": {"type": "boolean", "default": False},
-                    "bounty_rebate_bid_bps": {"type": "integer", "minimum": 0, "maximum": 9000, "default": 0},
+                    "liquidator_account_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Liquidator account ID (>= 1) credited with the liquidation bounty; defaults to session account_id when omitted.",
+                    },
+                    "market_id": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Target market ID to scan for underwater positions (0 = all markets; >= 1 required when --max-order-notional-usd is enabled).",
+                    },
+                    "target_account_id": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Specific underwater account ID to liquidate (0 = scan all eligible underwater accounts).",
+                    },
+                    "max_lots": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Maximum position size to liquidate in integer lots (1 lot = 1e-4 base, 0 = all eligible lots unless notional cap requires > 0).",
+                    },
+                    "min_bounty_usd": {
+                        "type": ["string", "number"],
+                        "description": "Minimum net liquidation bounty required in exact USD (e.g. '0.10'; atomic revert if unmet); mutually exclusive with min_bounty_micro.",
+                    },
+                    "min_bounty_micro": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": "Minimum net liquidation bounty required in integer micro-USD (1 micro = $1e-6, 0 = any non-negative bounty); mutually exclusive with min_bounty_usd.",
+                    },
+                    "flash_offload_to_book": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "When true, atomically offloads seized positions into resting L3 book liquidity so $0 pre-margin is required.",
+                    },
+                    "stp": {
+                        "type": "string",
+                        "enum": ["cancel_resting", "cancel_incoming", "cancel_both", "none"],
+                        "default": "cancel_resting",
+                        "description": "Self-Trade Prevention policy applied when flash-offloading onto the orderbook.",
+                    },
+                    "hedge_margin_spot": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, permits cross-margined Spot hedging during liquidation offload.",
+                    },
+                    "bounty_rebate_bid_bps": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9000,
+                        "default": 0,
+                        "description": "Optional competitive share of liquidation bounty rebated to the insurance reserve in basis points (0..9000 bps, 0 = keep 100%).",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "arena_onboard_and_deposit",
-            "description": "Self-service AI agent onboarding: logs in or generates an ephemeral EIP-191 wallet, optionally requests testnet collateral from POST /faucet, and optionally deposits ERC-20 margin on-chain into Clearinghouse.",
+            "description": (
+                "End-to-end self-service AI agent cold-start: logs in or generates an ephemeral EIP-191 wallet, claims Base Sepolia "
+                "testnet collateral + gas from POST /faucet, and deposits ERC-20 margin on-chain into Clearinghouse. Mutates session "
+                "auth, faucet state, and trading margin; use arena_login_wallet instead when your wallet is already funded or when "
+                "running $0-pre-margin flash arbitrage without on-chain deposits."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "generate_ephemeral": {"type": "boolean", "default": False},
-                    "request_faucet": {"type": "boolean", "default": True},
-                    "faucet_amount": {"type": ["string", "number"], "default": "10000"},
-                    "asset_symbol": {"type": "string", "default": "USD"},
-                    "drip_gas": {"type": "boolean", "default": True},
-                    "deposit_onchain": {"type": "boolean", "default": True},
-                    "deposit_amount": {"type": ["string", "number"]},
-                    "rpc_url": {"type": "string", "default": ""},
-                    "wait_for_credit": {"type": "boolean", "default": True},
-                    "poll_timeout_sec": {"type": "number", "minimum": 0.5, "maximum": 120.0, "default": 30.0},
+                    "generate_ephemeral": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "When true, generates a fresh CSPRNG secp256k1 wallet in-memory and authenticates it into this session.",
+                    },
+                    "request_faucet": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "When true, calls POST /faucet on testnet to mint test collateral (and optional gas) to the wallet.",
+                    },
+                    "faucet_amount": {
+                        "type": ["string", "number"],
+                        "default": "10000",
+                        "description": "Testnet collateral amount to request from POST /faucet in exact asset units (e.g. '10000' USD).",
+                    },
+                    "asset_symbol": {
+                        "type": "string",
+                        "default": "USD",
+                        "description": "Collateral asset symbol for faucet minting and Clearinghouse margin deposit (default 'USD').",
+                    },
+                    "drip_gas": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "When true with request_faucet, also requests Base Sepolia ETH gas drip for signing on-chain deposit transactions.",
+                    },
+                    "deposit_onchain": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "When true, broadcasts ERC-20 approve + Clearinghouse depositTraderMargin transactions on-chain.",
+                    },
+                    "deposit_amount": {
+                        "type": ["string", "number"],
+                        "description": "Exact collateral amount to deposit on-chain into Clearinghouse (defaults to faucet_amount when omitted).",
+                    },
+                    "rpc_url": {
+                        "type": "string",
+                        "default": "",
+                        "description": "Optional public HTTPS EVM JSON-RPC endpoint override for on-chain deposit (empty uses --rpc-url or chain default; loopback/private IPs blocked).",
+                    },
+                    "wait_for_credit": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "When true, polls GET /account until the Arena deposit indexer credits off-chain trading margin.",
+                    },
+                    "poll_timeout_sec": {
+                        "type": "number",
+                        "minimum": 0.5,
+                        "maximum": 120.0,
+                        "default": 30.0,
+                        "description": "Maximum seconds (0.5..120.0, default 30.0) to poll for off-chain margin credit when wait_for_credit=true.",
+                    },
                 },
                 "additionalProperties": False,
             },
         },
     ]
     for spec in raw_specs:
-        spec["annotations"] = _build_tool_annotations(str(spec["name"]))
+        ann = _build_tool_annotations(str(spec["name"]))
+        spec["title"] = ann["title"]
+        spec["annotations"] = ann
     return raw_specs
 
 
@@ -1073,9 +2161,9 @@ class ArenaMcpGateway:
         book_resp = self.adapter.http.book(market_id, depth=1)
         if book_resp.get("ok"):
             best = max(
-                abs(int(book_resp.get("best_ask_ticks", 0))),
-                abs(int(book_resp.get("mark_price_ticks", 0))),
-                abs(int(book_resp.get("best_bid_ticks", 0))),
+                abs(int(book_resp.get("best_ask_ticks") or 0)),
+                abs(int(book_resp.get("mark_price_ticks") or 0)),
+                abs(int(book_resp.get("best_bid_ticks") or 0)),
             )
             if best > 0:
                 return best
@@ -1083,10 +2171,10 @@ class ArenaMcpGateway:
         if tk_resp.get("ok") and isinstance(tk_resp.get("ticker"), dict):
             tk = tk_resp["ticker"]
             best_tk = max(
-                abs(int(tk.get("mark_price_ticks", 0))),
-                abs(int(tk.get("best_ask_ticks", 0))),
-                abs(int(tk.get("best_bid_ticks", 0))),
-                abs(int(tk.get("last_trade_price_ticks", 0))),
+                abs(int(tk.get("mark_price_ticks") or 0)),
+                abs(int(tk.get("best_ask_ticks") or 0)),
+                abs(int(tk.get("best_bid_ticks") or 0)),
+                abs(int(tk.get("last_trade_price_ticks") or 0)),
             )
             if best_tk > 0:
                 return best_tk
@@ -1840,11 +2928,13 @@ class ArenaMcpGateway:
                     unified = self.adapter._unified_symbol_for_market(m)
                     if sym_f and sym_f not in (str(m.get("symbol", "")).upper(), unified.upper()):
                         continue
+                    bid_t = int(m.get("best_bid_ticks") or 0)
+                    ask_t = int(m.get("best_ask_ticks") or 0)
                     item = dict(m)
                     item["unified_symbol"] = unified
-                    item["mark_price_usd"] = price_ticks_to_usd_str(int(m.get("mark_price_ticks", 0)))
-                    item["best_bid_usd"] = price_ticks_to_usd_str(int(m.get("best_bid_ticks", 0)))
-                    item["best_ask_usd"] = price_ticks_to_usd_str(int(m.get("best_ask_ticks", 0)))
+                    item["mark_price_usd"] = price_ticks_to_usd_str(int(m.get("mark_price_ticks") or 0))
+                    item["best_bid_usd"] = price_ticks_to_usd_str(bid_t) if bid_t != 0 else None
+                    item["best_ask_usd"] = price_ticks_to_usd_str(ask_t) if ask_t != 0 else None
                     filtered.append(item)
                 return self._ok_tool_result({"wal_seq": resp.get("wal_seq", 0), "count": len(filtered), "markets": filtered})
 
@@ -2604,12 +3694,15 @@ class ArenaMcpGateway:
 
             if name == "arena_preview_order":
                 explicit_aid = args.get("account_id")
-                if (
-                    self._public_unauth_http_mode
-                    and explicit_aid is None
+                is_unauth_zero_key = (
+                    explicit_aid is not None and int(explicit_aid) == 0
+                ) or (
+                    explicit_aid is None
                     and int(self.adapter.account_id) <= 0
-                ):
-                    aid = 1
+                    and (self._public_unauth_http_mode or not self._has_authenticated_credentials())
+                )
+                if is_unauth_zero_key:
+                    aid = 0
                     self._check_account_allowlist(aid)
                 else:
                     aid = self._effective_account(explicit_aid)
@@ -2658,9 +3751,12 @@ class ArenaMcpGateway:
                 }
                 preview_hint = (
                     "POST /order/preview simulates account-bound Eigen-SPAN margin (IMR/MMR/free collateral) "
-                    "and requires an authenticated session. Run `uvx feraterra-sdk --testnet` locally and "
+                    "on backends requiring an authenticated account. Run `uvx feraterra-sdk --testnet` locally and "
                     "call `arena_onboard_and_deposit` (`generate_ephemeral=true`) to spin up an ephemeral "
                     "EIP-191 wallet for full pre-trade margin simulation."
+                )
+                allow_unauth_hint = is_unauth_zero_key and (
+                    self._public_unauth_http_mode or not self._has_authenticated_credentials()
                 )
                 try:
                     res = self.adapter.preview_order(
@@ -2673,19 +3769,23 @@ class ArenaMcpGateway:
                     )
                 except Exception as prev_exc:
                     exc_lc = str(prev_exc).lower()
-                    if self._public_unauth_http_mode and (
+                    if allow_unauth_hint and (
                         "missing_auth_headers" in exc_lc
                         or "missing_auth" in exc_lc
+                        or "unauthorized" in exc_lc
+                        or "invalid_account_id" in exc_lc
                         or "401" in exc_lc
+                        or "400" in exc_lc
                     ):
+                        inferred_st = 400 if ("400" in exc_lc and "401" not in exc_lc) else 401
                         return self._ok_tool_result(
                             {
                                 "ok": False,
                                 "preview": True,
                                 "would_accept": False,
                                 "auth_required": True,
-                                "http_status": 401,
-                                "error": "missing_auth_headers",
+                                "http_status": inferred_st,
+                                "error": "missing_auth_headers" if inferred_st == 401 else "invalid_account_id",
                                 "symbol": self.adapter._unified_symbol_for_market(m),
                                 "market_id": mid,
                                 "side": "buy" if side_raw in ("buy", "bid") else "sell",
@@ -2699,9 +3799,20 @@ class ArenaMcpGateway:
                 info_obj = res.get("info") if isinstance(res.get("info"), dict) else res
                 err_code_lc = str(info_obj.get("error") or res.get("error") or "").strip().lower()
                 http_st = int(info_obj.get("http_status") or res.get("http_status") or 0)
-                if self._public_unauth_http_mode and (
-                    http_st == 401
-                    or err_code_lc in ("missing_auth_headers", "missing_auth", "unauthorized")
+                if (
+                    allow_unauth_hint
+                    and not bool(info_obj.get("ok", False))
+                    and (
+                        http_st in (400, 401)
+                        or err_code_lc
+                        in (
+                            "missing_auth_headers",
+                            "missing_auth",
+                            "unauthorized",
+                            "invalid_account_id",
+                            "account_id_required",
+                        )
+                    )
                 ):
                     return self._ok_tool_result(
                         {
@@ -3122,10 +4233,11 @@ class ArenaMcpGateway:
                 status_code: int,
                 body_bytes: bytes,
                 extra_headers: Optional[Dict[str, str]] = None,
+                content_type: str = "application/json; charset=utf-8",
             ) -> None:
                 self._drain_unconsumed_body()
                 self.send_response(status_code)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body_bytes)))
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Access-Control-Allow-Origin", "*")
@@ -3148,7 +4260,11 @@ class ArenaMcpGateway:
 
             def do_DELETE(self) -> None:
                 path_clean = self.path.split("?", 1)[0]
-                allow_hdr = "GET, OPTIONS" if path_clean in ("/mcp/health", "/health") else "POST, OPTIONS"
+                allow_hdr = (
+                    "GET, OPTIONS"
+                    if path_clean in ("/mcp/health", "/health", "/mcp/server-card", "/.well-known/mcp/server-card.json")
+                    else "POST, OPTIONS"
+                )
                 self._send_json_bytes(
                     405,
                     b'{"ok":false,"error":"method_not_allowed"}',
@@ -3157,6 +4273,16 @@ class ArenaMcpGateway:
 
             def do_GET(self) -> None:
                 path_clean = self.path.split("?", 1)[0]
+                if path_clean in ("/mcp/server-card", "/.well-known/mcp/server-card.json"):
+                    accept_sc = str(self.headers.get("Accept", "")).lower()
+                    sc_ct = (
+                        "application/mcp-server-card+json; charset=utf-8"
+                        if "application/mcp-server-card+json" in accept_sc and "application/json" not in accept_sc
+                        else "application/json; charset=utf-8"
+                    )
+                    card_bytes = _json_dumps(_build_server_card()).encode("utf-8")
+                    self._send_json_bytes(200, card_bytes, content_type=sc_ct)
+                    return
                 if path_clean in ("/mcp/health", "/health"):
                     body = _json_dumps(
                         {
@@ -3977,8 +5103,8 @@ def _run_mcp_self_test() -> None:
         # #3.4: static creds block wallet login without allow_wallet_login=True + restore creds metadata on failure
         static_gw = ArenaMcpGateway(
             account_id=2,
-            api_key="static_k",
-            api_secret="static_secret_tok_xyz",
+            api_key="[static-test-key]",
+            api_secret="[static-test-secret]",
             allowed_accounts=frozenset({2}),
             allow_wallet_login=False,
         )
@@ -3992,8 +5118,8 @@ def _run_mcp_self_test() -> None:
         class _CredsStubHttp(_StubHttp):
             def __init__(self) -> None:
                 super().__init__()
-                self.api_key = "k_orig_abc123"
-                self.api_secret = "s_orig_secret_789"
+                self.api_key = "[orig-test-key]"
+                self.api_secret = "[orig-test-secret]"
                 self._creds_path = "/tmp/fake_creds.json"
                 self._creds_role = "trader"
                 self._creds_fallback_role = "operator"
@@ -4010,7 +5136,7 @@ def _run_mcp_self_test() -> None:
                 self.set_credentials("ephemeral_k", "ephemeral_s")
                 return {"ok": True, "account_id": 999}
 
-        rb_gw = ArenaMcpGateway(account_id=2, api_key="k_orig_abc123", api_secret="s_orig_secret_789", allowed_accounts=frozenset({2}), allow_wallet_login=True)
+        rb_gw = ArenaMcpGateway(account_id=2, api_key="[orig-test-key]", api_secret="[orig-test-secret]", allowed_accounts=frozenset({2}), allow_wallet_login=True)
         rb_stub = _CredsStubHttp()
         rb_gw.adapter.http.close()
         rb_gw.adapter.http = rb_stub  # type: ignore[assignment]
@@ -4018,7 +5144,7 @@ def _run_mcp_self_test() -> None:
             rb_res = rb_gw.call_tool("arena_login_wallet", {"generate_ephemeral": True})
             assert rb_res["isError"] and "account_not_in_allowed_accounts" in rb_res["content"][0]["text"], rb_res
             assert rb_stub._creds_path == "/tmp/fake_creds.json" and rb_stub._creds_mtime_ns == 123456, rb_stub.__dict__
-            assert rb_stub.api_secret == "s_orig_secret_789"
+            assert rb_stub.api_secret == "[orig-test-secret]"
         finally:
             rb_gw.close()
 
@@ -4115,12 +5241,29 @@ def _run_mcp_self_test() -> None:
         )
         assert init_fb is not None and init_fb["result"]["protocolVersion"] == "2024-11-05", init_fb
 
-        # v4.9.3 Upgrade 3: ToolAnnotations on all 24 tools
+        # v4.9.3 Upgrade 3 & v4.9.4 TDQS/Schema Polish: ToolAnnotations, top-level title, and 223/223 property descriptions
         all_specs_24 = _tool_specs()
         assert len(all_specs_24) == 24
+        prop_total_cnt = 0
+        prop_desc_cnt = 0
         for sp in all_specs_24:
             ann = sp.get("annotations")
             assert isinstance(ann, dict) and isinstance(ann.get("title"), str) and len(ann["title"]) > 0, sp
+            assert sp.get("title") == ann["title"], sp
+            assert isinstance(sp.get("description"), str) and len(sp["description"].strip()) >= 40, sp
+            for pk, pv in sp["inputSchema"]["properties"].items():
+                prop_total_cnt += 1
+                assert isinstance(pv.get("description"), str) and len(pv["description"].strip()) > 0, (sp["name"], pk)
+                prop_desc_cnt += 1
+                if "items" in pv and "properties" in pv["items"]:
+                    for npk, npv in pv["items"]["properties"].items():
+                        prop_total_cnt += 1
+                        assert isinstance(npv.get("description"), str) and len(npv["description"].strip()) > 0, (
+                            sp["name"],
+                            pk,
+                            npk,
+                        )
+                        prop_desc_cnt += 1
             tname_sp = sp["name"]
             if tname_sp in READ_ONLY_TOOLS:
                 exp_hints = (True, False, True, True)
@@ -4137,6 +5280,7 @@ def _run_mcp_self_test() -> None:
                 ann.get("openWorldHint"),
             )
             assert got_hints == exp_hints, (tname_sp, got_hints, exp_hints)
+        assert prop_total_cnt == 223 and prop_desc_cnt == 223, (prop_desc_cnt, prop_total_cnt)
 
         # v4.9.3 Upgrade 4: prompts/list & prompts/get
         plist_resp = gw.handle_jsonrpc_message({"jsonrpc": "2.0", "id": 92, "method": "prompts/list"})
@@ -4196,6 +5340,19 @@ def _run_mcp_self_test() -> None:
             assert "arena_get_withdrawals_and_escape_proof" not in pub_tool_names
             assert pub_tool_names == (READ_ONLY_TOOLS - PUBLIC_UNAUTH_HIDDEN_READ_TOOLS)
 
+            seen_pub_prev_aids: List[int] = []
+            pub_gw.adapter.http.preview_order = lambda **kwargs: (  # type: ignore[method-assign]
+                seen_pub_prev_aids.append(int(kwargs["account_id"]))
+                or stub.preview_order(**kwargs)
+            )
+            pub_prev_zero_ok = pub_gw.call_tool(
+                "arena_preview_order",
+                {"symbol": "BTC/USD:USD", "side": "buy", "price_usd": "50000", "amount_base": "0.1"},
+            )
+            assert not pub_prev_zero_ok["isError"], pub_prev_zero_ok
+            assert seen_pub_prev_aids == [0], seen_pub_prev_aids
+            assert pub_prev_zero_ok["structuredContent"]["would_accept"] is True
+
             pub_gw.adapter.http.preview_order = lambda **kwargs: {  # type: ignore[method-assign]
                 "ok": False,
                 "error": "missing_auth_headers",
@@ -4210,6 +5367,38 @@ def _run_mcp_self_test() -> None:
             pub_prev_obj = pub_prev["structuredContent"]
             assert pub_prev_obj["auth_required"] is True and pub_prev_obj["http_status"] == 401, pub_prev_obj
             assert "uvx feraterra-sdk --testnet" in pub_prev_obj["hint"], pub_prev_obj
+
+            pub_gw.adapter.http.preview_order = lambda **kwargs: {  # type: ignore[method-assign]
+                "ok": False,
+                "error": "invalid_account_id",
+                "http_status": 400,
+            }
+            pub_prev_400 = pub_gw.call_tool(
+                "arena_preview_order",
+                {"account_id": 0, "symbol": "BTC/USD:USD", "side": "buy", "price_usd": "50000", "amount_base": "0.1"},
+            )
+            assert not pub_prev_400["isError"], pub_prev_400
+            assert pub_prev_400["structuredContent"]["auth_required"] is True
+            assert pub_prev_400["structuredContent"]["http_status"] == 400
+
+            pub_gw.adapter.http.markets = lambda: {  # type: ignore[method-assign]
+                "ok": True,
+                "wal_seq": 100,
+                "markets": [
+                    {
+                        "market_id": 1,
+                        "symbol": "BTC-USD-PERP",
+                        "kind": "linear_perpetual",
+                        "mark_price_ticks": 6_000_000,
+                        "best_bid_ticks": 0,
+                        "best_ask_ticks": 0,
+                    }
+                ],
+            }
+            lm_empty = pub_gw.call_tool("arena_list_markets", {})
+            assert not lm_empty["isError"], lm_empty
+            lm_mkt0 = lm_empty["structuredContent"]["markets"][0]
+            assert lm_mkt0["best_bid_usd"] is None and lm_mkt0["best_ask_usd"] is None, lm_mkt0
 
             # Verify lock-free execution when another thread holds _dispatch_lock
             lock_acquired_evt = threading.Event()
@@ -4266,7 +5455,7 @@ def _run_mcp_self_test() -> None:
         import urllib.error
         import urllib.request
 
-        http_srv = gw.create_http_server(host="127.0.0.1", port=0, bearer_token="gladiator-secret")
+        http_srv = gw.create_http_server(host="127.0.0.1", port=0, bearer_token="[gladiator-test-token]")
         http_port = int(http_srv.server_address[1])
         http_thr = threading.Thread(target=http_srv.serve_forever, daemon=True)
         http_thr.start()
@@ -4274,7 +5463,24 @@ def _run_mcp_self_test() -> None:
             with urllib.request.urlopen(f"http://127.0.0.1:{http_port}/mcp/health", timeout=3.0) as hresp:
                 hj = json.loads(hresp.read().decode("utf-8"))
                 assert hj["ok"] is True and hj["tool_count"] == 24
+                assert hj["version"] == "4.9.4"
                 assert "2025-11-25" in hj["supportedProtocolVersions"]
+
+            for sc_path in ("/mcp/server-card", "/.well-known/mcp/server-card.json"):
+                with urllib.request.urlopen(f"http://127.0.0.1:{http_port}{sc_path}", timeout=3.0) as scresp:
+                    scj = json.loads(scresp.read().decode("utf-8"))
+                    assert scj["$schema"] == "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json", scj
+                    assert scj["name"] == "io.github.FeraTerra/feraterra-sdk", scj
+                    assert scj["version"] == "4.9.4", scj
+                    assert scj["websiteUrl"] == "https://feraterra.app", scj
+                    assert scj["repository"] == {"url": "https://github.com/FeraTerra/feraterra-sdk", "source": "github"}, scj
+                    assert scj["remotes"] == [
+                        {
+                            "type": "streamable-http",
+                            "url": "https://mcp.feraterra.app/mcp",
+                            "supportedProtocolVersions": ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
+                        }
+                    ], scj
 
             got_405 = False
             try:
@@ -4335,7 +5541,7 @@ def _run_mcp_self_test() -> None:
             too_big_http = urllib.request.Request(
                 f"http://127.0.0.1:{http_port}/mcp",
                 data=big_stdio_msg,
-                headers={"Content-Type": "application/json", "Authorization": "Bearer gladiator-secret"},
+                headers={"Content-Type": "application/json", "Authorization": "Bearer [gladiator-test-token]"},
                 method="POST",
             )
             got_413 = False
@@ -4355,7 +5561,7 @@ def _run_mcp_self_test() -> None:
                 busy_req = urllib.request.Request(
                     f"http://127.0.0.1:{http_port}/mcp",
                     data=b'{"jsonrpc":"2.0","id":1,"method":"ping"}',
-                    headers={"Content-Type": "application/json", "Authorization": "Bearer gladiator-secret"},
+                    headers={"Content-Type": "application/json", "Authorization": "Bearer [gladiator-test-token]"},
                     method="POST",
                 )
                 got_503 = False
@@ -4379,7 +5585,7 @@ def _run_mcp_self_test() -> None:
             notif_req = urllib.request.Request(
                 f"http://127.0.0.1:{http_port}/mcp",
                 data=b'{"jsonrpc":"2.0","method":"notifications/initialized"}',
-                headers={"Content-Type": "application/json", "Authorization": "Bearer gladiator-secret"},
+                headers={"Content-Type": "application/json", "Authorization": "Bearer [gladiator-test-token]"},
                 method="POST",
             )
             with urllib.request.urlopen(notif_req, timeout=3.0) as nresp:
@@ -4388,7 +5594,7 @@ def _run_mcp_self_test() -> None:
             tl_req = urllib.request.Request(
                 f"http://127.0.0.1:{http_port}/mcp",
                 data=b'{"jsonrpc":"2.0","id":7,"method":"tools/list"}',
-                headers={"Content-Type": "application/json", "Authorization": "Bearer gladiator-secret"},
+                headers={"Content-Type": "application/json", "Authorization": "Bearer [gladiator-test-token]"},
                 method="POST",
             )
             with urllib.request.urlopen(tl_req, timeout=3.0) as tresp:
@@ -4428,7 +5634,7 @@ def _run_mcp_self_test() -> None:
     finally:
         gw.close()
 
-    print("[PASS] arena_mcp_server.py v4.9.3 MCP gateway self-test OK")
+    print("[PASS] arena_mcp_server.py v4.9.4 MCP gateway self-test OK")
 
 
 def main(argv: Optional[List[str]] = None) -> int:

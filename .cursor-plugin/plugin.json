@@ -1,0 +1,10 @@
+{
+  "name": "feraterra",
+  "version": "4.9.4",
+  "description": "FeraTerra / Arena Exchange headless CLOB trading, zero-capital arbitrage, L2 Clearinghouse solvency, and MCP agent skill.",
+  "author": {
+    "name": "FeraTerra"
+  },
+  "license": "MIT",
+  "skills": "./skills/"
+}

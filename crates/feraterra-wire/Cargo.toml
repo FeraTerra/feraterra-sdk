@@ -1,0 +1,15 @@
+[package]
+name = "feraterra-wire"
+version = "4.9.4"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+authors = ["FeraTerra"]
+description = "Zero-dependency #![no_std] 64-byte big-endian ArenaWire & ArenaITCH HFT codec with dual SipHash-2-4 MACs for FeraTerra"
+repository = "https://github.com/FeraTerra/feraterra-sdk"
+homepage = "https://feraterra.app"
+documentation = "https://testnet.feraterra.app/llms.txt"
+keywords = ["hft", "trading", "exchange", "clob", "no-std"]
+categories = ["network-programming", "encoding", "no-std"]
+
+[dependencies]

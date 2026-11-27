@@ -3,8 +3,8 @@
   "name": "io.github.FeraTerra/feraterra-sdk",
   "title": "Arena Exchange Headless Trading & Risk MCP",
   "description": "Headless 24-tool MCP gateway for Arena Exchange spot, perps, previews, flash arb, and L2 custody.",
-  "version": "4.9.3",
-  "websiteUrl": "https://testnet.feraterra.app",
+  "version": "4.9.4",
+  "websiteUrl": "https://feraterra.app",
   "repository": {
     "url": "https://github.com/FeraTerra/feraterra-sdk",
     "source": "github"
@@ -13,7 +13,8 @@
     {
       "registryType": "pypi",
       "identifier": "feraterra-sdk",
-      "version": "4.9.3",
+      "version": "4.9.4",
+      "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
       },
@@ -37,9 +38,9 @@
     },
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/FeraTerra/feraterra-sdk/releases/download/v4.9.3/feraterra-sdk.mcpb",
-      "fileSha256": "2da2f3948d8669ae00a114c6c6d861294a7409ea107ffe6010d71742e62ab89a",
-      "version": "4.9.3",
+      "identifier": "https://github.com/FeraTerra/feraterra-sdk/releases/download/v4.9.4/feraterra-sdk.mcpb",
+      "fileSha256": "3e7d930a063fe8f551ccc2463159fceba502d4ce95ef041710cf408055436525",
+      "version": "4.9.4",
       "transport": {
         "type": "stdio"
       },

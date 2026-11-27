@@ -1,5 +1,5 @@
 """
-FeraTerra / Arena Exchange v4.9.3 — Official Python SDK & AI Agent Framework Connector
+FeraTerra / Arena Exchange v4.9.4 — Official Python SDK & AI Agent Framework Connector
 (`sdk/python/feraterra_sdk.py`)
 
 Re-exports the complete zero-dependency `arena_sdk` surface (`ArenaHttpClient`,
@@ -27,7 +27,7 @@ if str(_SDK_DIR) not in sys.path:
 import arena_sdk as _arena_sdk  # noqa: E402
 from arena_sdk import *  # noqa: E402,F401,F403
 
-__version__: str = str(getattr(_arena_sdk, "__version__", "4.9.3"))
+__version__: str = str(getattr(_arena_sdk, "__version__", "4.9.4"))
 _arena_verify_ledger_tip = _arena_sdk.verify_ledger_tip
 
 
@@ -87,11 +87,13 @@ def _build_core_agent_tools(
                 continue
             if active_only and str(m.get("trading_status", "live")).lower() == "halted":
                 continue
+            bid_t = int(m.get("best_bid_ticks") or 0)
+            ask_t = int(m.get("best_ask_ticks") or 0)
             item = dict(m)
             item["unified_symbol"] = adapter._unified_symbol_for_market(m)
-            item["mark_price_usd"] = price_ticks_to_usd_str(int(m.get("mark_price_ticks", 0)))
-            item["best_bid_usd"] = price_ticks_to_usd_str(int(m.get("best_bid_ticks", 0)))
-            item["best_ask_usd"] = price_ticks_to_usd_str(int(m.get("best_ask_ticks", 0)))
+            item["mark_price_usd"] = price_ticks_to_usd_str(int(m.get("mark_price_ticks") or 0))
+            item["best_bid_usd"] = price_ticks_to_usd_str(bid_t) if bid_t != 0 else None
+            item["best_ask_usd"] = price_ticks_to_usd_str(ask_t) if ask_t != 0 else None
             markets_out.append(item)
         return {
             "ok": True,
@@ -487,6 +489,9 @@ def _run_self_test() -> int:
     # Make sure module-level verify_ledger_tip was not shadowed
     if verify_ledger_tip is not _arena_sdk.verify_ledger_tip:
         print("[FAIL] verify_ledger_tip re-export identity broken", file=sys.stderr)
+        return 1
+    if __version__ != "4.9.4":
+        print(f"[FAIL] Expected __version__ == '4.9.4', got {__version__!r}", file=sys.stderr)
         return 1
 
     print("[PASS] feraterra_sdk.py self-test OK")

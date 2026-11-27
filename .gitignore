@@ -12,6 +12,16 @@ venv/
 .mypy_cache/
 .ruff_cache/
 
+# CMake build artifacts
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Rust / Cargo build artifacts
+target/
+Cargo.lock
+
 # Local secrets & credentials (never commit keys)
 .env
 .env.*
