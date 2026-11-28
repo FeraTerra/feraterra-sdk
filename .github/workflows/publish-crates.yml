@@ -1,0 +1,98 @@
+name: Publish Rust Crate to crates.io
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish-crates:
+    name: Test & Publish feraterra-wire to crates.io (OIDC or Token)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Run feraterra-wire unit & golden vector tests
+        run: cargo test --manifest-path crates/feraterra-wire/Cargo.toml
+
+      - name: Verify crates.io package tarball
+        run: cargo package --manifest-path crates/feraterra-wire/Cargo.toml
+
+      - name: Publish feraterra-wire to crates.io (OIDC or Token)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          python3 - << 'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          import urllib.request
+
+          token = (os.environ.get("CARGO_REGISTRY_TOKEN") or os.environ.get("CRATES_IO_TOKEN") or "").strip()
+          if not token:
+              token = (os.environ.get("CRATES_IO_TOKEN") or "").strip()
+          used_oidc = False
+          req_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "").strip()
+          req_tok = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "").strip()
+          ua = "feraterra-sdk-ci (https://github.com/FeraTerra/feraterra-sdk)"
+
+          if not token and req_url and req_tok:
+              try:
+                  sep = "&" if "?" in req_url else "?"
+                  r1 = urllib.request.Request(
+                      f"{req_url}{sep}audience=crates.io",
+                      headers={"Authorization": f"bearer {req_tok}"},
+                  )
+                  with urllib.request.urlopen(r1, timeout=15) as resp:
+                      jwt_val = json.loads(resp.read().decode("utf-8")).get("value", "").strip()
+                  if jwt_val:
+                      r2 = urllib.request.Request(
+                          "https://crates.io/api/v1/trusted_publishing/tokens",
+                          data=json.dumps({"jwt": jwt_val}).encode("utf-8"),
+                          method="POST",
+                          headers={"Content-Type": "application/json", "User-Agent": ua},
+                      )
+                      with urllib.request.urlopen(r2, timeout=15) as resp2:
+                          token = json.loads(resp2.read().decode("utf-8")).get("token", "").strip()
+                          if token:
+                              used_oidc = True
+              except Exception as exc:
+                  print(f"::notice::crates.io OIDC token exchange unavailable ({exc}); checking fallback.")
+
+          if not token:
+              print(
+                  "::notice::Skipping cargo publish to crates.io (neither secrets.CARGO_REGISTRY_TOKEN, secrets.CRATES_IO_TOKEN, nor crates.io OIDC Trusted Publisher is bound yet); feraterra-wire passed cargo test & cargo package."
+              )
+              sys.exit(0)
+
+          print(f"::add-mask::{token}", flush=True)
+          env = dict(os.environ)
+          env["CARGO_REGISTRY_TOKEN"] = token
+          try:
+              rc = subprocess.call(
+                  ["cargo", "publish", "--manifest-path", "crates/feraterra-wire/Cargo.toml"],
+                  env=env,
+              )
+              sys.exit(rc)
+          finally:
+              if used_oidc:
+                  try:
+                      r3 = urllib.request.Request(
+                          "https://crates.io/api/v1/trusted_publishing/tokens",
+                          method="DELETE",
+                          headers={"Authorization": f"Bearer {token}", "User-Agent": ua},
+                      )
+                      urllib.request.urlopen(r3, timeout=10).close()
+                  except Exception:
+                      pass
+          PY

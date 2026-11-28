@@ -1,0 +1,37 @@
+# Python bytecode & packaging
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# CMake build artifacts
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Rust / Cargo build artifacts
+target/
+Cargo.lock
+
+# Local secrets & credentials (never commit keys)
+.env
+.env.*
+*.privkey
+*.pem
+*.key
+*.hex
+*creds*.json
+secrets/
+
+# OS metadata
+.DS_Store
+Thumbs.db

@@ -1,0 +1,72 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.FeraTerra/feraterra-sdk",
+  "title": "Arena Exchange Headless Trading & Risk MCP",
+  "description": "Headless 24-tool MCP gateway for Arena Exchange spot, perps, previews, flash arb, and L2 custody.",
+  "version": "4.9.5",
+  "websiteUrl": "https://feraterra.app",
+  "repository": {
+    "url": "https://github.com/FeraTerra/feraterra-sdk",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "feraterra-sdk",
+      "version": "4.9.5",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "ARENA_NETWORK",
+          "description": "Arena network preset ('testnet' connects to https://testnet.feraterra.app; 'local' uses loopback).",
+          "isRequired": false,
+          "format": "string",
+          "default": "testnet",
+          "isSecret": false
+        },
+        {
+          "name": "ARENA_URL",
+          "description": "Optional explicit Arena Exchange HTTP base URL override.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        }
+      ]
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/FeraTerra/feraterra-sdk/releases/download/v4.9.5/feraterra-sdk.mcpb",
+      "fileSha256": "e75f6235e2ed5700576c962f3adcc9beb709018e01d07235dbfdce846729ed9f",
+      "version": "4.9.5",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "ARENA_NETWORK",
+          "description": "Arena network preset ('testnet' connects to https://testnet.feraterra.app; 'local' uses loopback).",
+          "isRequired": false,
+          "format": "string",
+          "default": "testnet",
+          "isSecret": false
+        },
+        {
+          "name": "ARENA_URL",
+          "description": "Optional explicit Arena Exchange HTTP base URL override.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        }
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.feraterra.app/mcp"
+    }
+  ]
+}

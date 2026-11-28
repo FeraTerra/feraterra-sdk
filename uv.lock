@@ -1,0 +1,7 @@
+version = 1
+requires-python = ">=3.10"
+
+[[package]]
+name = "feraterra-sdk"
+version = "4.9.5"
+source = { virtual = "." }
